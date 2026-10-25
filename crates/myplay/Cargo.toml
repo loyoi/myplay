@@ -39,6 +39,8 @@ tray-icon = { workspace = true }
 windows = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",
+  # `AttachThreadInput` / `GetCurrentThreadId`：启动时把主窗口抢到前台（借前台线程的输入权限）。
+  "Win32_System_Threading",
 ] }
 
 [build-dependencies]
