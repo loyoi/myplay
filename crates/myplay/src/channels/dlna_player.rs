@@ -1,4 +1,4 @@
-//! DLNA 音频播放：拉流 → symphonia 解码 → cpal 输出。
+//! DLNA 音频播放：拉流 → symphonia 解码 → 重采样到设备采样率 → cpal 输出。
 //!
 //! 关键设计：**命令线程只做调度，解码在独立线程里跑**。每首歌/每次操作都会自增
 //! 「代次」（generation），解码线程每写一批采样就核对代次，不匹配立即退出——这样
@@ -8,16 +8,16 @@
 //! **不分配内存、不打开文件、不做字符串处理**，缓冲腾挪靠 [`Condvar`] 通知而不是轮询。
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use fusionplay_core::DmrController;
-use symphonia::core::audio::GenericAudioBufferRef;
+use symphonia::core::audio::{Channels, GenericAudioBufferRef};
 use symphonia::core::codecs::CodecParameters;
-use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
@@ -34,6 +34,13 @@ const BUFFER_MS: usize = 400;
 const FULL_WAIT: Duration = Duration::from_millis(20);
 /// 进度回报间隔（毫秒）。
 const PROGRESS_REPORT_MS: u64 = 500;
+/// 连续多少个音频包解码失败就判定这条流已失效（单个坏包仍然跳过）。
+const DECODE_FAILURE_LIMIT: u32 = 8;
+/// 流式补偿（跳过/缓存）的块读大小。
+const HTTP_CHUNK: usize = 16 * 1024;
+/// 服务端忽略 Range 时允许整包缓存到内存的上限。超过它就退回「本地跳字节」，
+/// 以免一条长视频/大无损把内存吃光。
+const STREAM_CACHE_LIMIT: u64 = 64 * 1024 * 1024;
 
 /// 播放器句柄。
 #[derive(Clone)]
@@ -49,7 +56,7 @@ pub struct Player {
 struct Track {
     /// 拉流地址。
     url: String,
-    /// 服务器给出的 Content-Type，用于猜测容器格式。
+    /// 控制点在 DIDL 里声明的 mime（只当 probe 提示用；HTTP 头的 Content-Type 另外打日志）。
     mime: Option<String>,
     /// 曲名。
     title: Option<String>,
@@ -57,6 +64,55 @@ struct Track {
     artist: Option<String>,
     /// 专辑。
     album: Option<String>,
+    /// 控制点在 DIDL-Lite 里声明的质量（不参与播放，只用于诊断日志对比）。
+    declared: DeclaredQuality,
+}
+
+/// 控制点声明的质量参数（`dlna_media` 事件里的 `bitrate_bps` / `sample_rate` / …）。
+///
+/// 这些值只做诊断：真正显示给用户的是我们拉流后实测出来的编码与码率。
+/// 两侧对不上时，就能区分「发送端只给了这个质量」和「我们显示错了」。
+#[derive(Clone, Copy, Debug, Default)]
+struct DeclaredQuality {
+    /// `<res bitrate>`（bps）。
+    bitrate_bps: Option<u64>,
+    /// `<res sampleFrequency>`（Hz）。
+    sample_rate: Option<u64>,
+    /// `<res bitsPerSample>`。
+    bits_per_sample: Option<u64>,
+    /// `<res nrAudioChannels>`。
+    channels: Option<u64>,
+    /// `<res duration>`（毫秒）。
+    duration_ms: Option<u64>,
+}
+
+impl DeclaredQuality {
+    /// 从核心的 `dlna_media` 事件里读出声明质量；缺字段留 `None`。
+    fn from_event(value: &serde_json::Value) -> Self {
+        let field = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+        Self {
+            bitrate_bps: field("bitrate_bps"),
+            sample_rate: field("sample_rate"),
+            bits_per_sample: field("bits_per_sample"),
+            channels: field("channels"),
+            duration_ms: field("duration_ms"),
+        }
+    }
+}
+
+/// 诊断用单行文本（缺失字段写 `-`）；直接 `{}` 输出，不额外分配。
+impl std::fmt::Display for DeclaredQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "码率={} 采样率={} 位深={} 声道={} 时长={}ms",
+            fmt_opt(self.bitrate_bps),
+            fmt_opt(self.sample_rate),
+            fmt_opt(self.bits_per_sample),
+            fmt_opt(self.channels),
+            fmt_opt(self.duration_ms),
+        )
+    }
 }
 
 /// 播放线程命令。
@@ -155,6 +211,8 @@ struct Shared {
     generation: AtomicU64,
     /// 是否暂停（音频回调每帧读，用 `Relaxed` 即可）。
     paused: AtomicBool,
+    /// 输出流的采样率（Hz）；0 表示输出流还没建好。解码线程据此重采样。
+    output_rate: AtomicU32,
     /// 播放线程是否已处理完 `Stop`（已回报 DMR、已发媒体流结束）。
     ///
     /// 收尾顺序用：GENA 的 `STOPPED` 通知必须在核心运行时还活着时发出，
@@ -173,6 +231,7 @@ impl Shared {
             drained: Condvar::new(),
             generation: AtomicU64::new(0),
             paused: AtomicBool::new(false),
+            output_rate: AtomicU32::new(0),
             stop_reported: AtomicBool::new(false),
             track: Mutex::new(None),
             controller: Mutex::new(None),
@@ -195,6 +254,12 @@ impl Shared {
     /// 该代次是否仍然有效。
     fn is_current(&self, generation: u64) -> bool {
         self.generation.load(Ordering::Acquire) == generation
+    }
+
+    /// 输出流的采样率（Hz）；建流前返回 `None`。
+    fn output_rate(&self) -> Option<u64> {
+        let rate = self.output_rate.load(Ordering::Acquire);
+        (rate > 0).then(|| u64::from(rate))
     }
 }
 
@@ -289,6 +354,7 @@ impl Player {
                     title: text_field(value, "title"),
                     artist: text_field(value, "artist"),
                     album: text_field(value, "album"),
+                    declared: DeclaredQuality::from_event(value),
                 };
                 let start_ms = value
                     .get("start_position_ms")
@@ -449,7 +515,14 @@ fn decode(
             FormatOptions::default(),
             MetadataOptions::default(),
         )
-        .context("无法识别媒体格式（可能是加密/会员流）")?;
+        .with_context(|| {
+            // 探测失败时就看不到下面那行质量诊断了，把关键上下文塞进错误链。
+            format!(
+                "无法识别媒体格式（可能是加密/会员流）：mime={:?} 地址={}",
+                track.mime,
+                url_shape(&track.url)
+            )
+        })?;
     let mut format = probed;
     let track_info = format
         .default_track(TrackType::Audio)
@@ -464,18 +537,45 @@ fn decode(
         .num_frames
         .map(|frames| frames * 1000 / u64::from(sample_rate))
         .unwrap_or(0);
-    let mut decoder = symphonia::default::get_codecs()
-        .make_audio_decoder(&params, &AudioDecoderOptions::default())
-        .context("不支持的音频编码")?;
-
     let bitrate = match (total_bytes, duration_ms) {
         (Some(bytes), duration) if duration > 0 => bytes * 8 * 1000 / duration,
         _ => 0,
     };
+    // 源采样率与设备采样率不一致时必须重采样，否则会变调变速（见 [`Resampler`]）。
+    let output_rate = shared.output_rate().unwrap_or_else(|| {
+        // 只可能发生在建流信息还没落地时；此时退化为不重采样，至少要留痕。
+        log::warn!("输出流采样率未知，本曲不做重采样（可能出现变调/变速）");
+        u64::from(sample_rate)
+    });
+    let mut resampler = (output_rate != u64::from(sample_rate))
+        .then(|| Resampler::new(u64::from(sample_rate), output_rate));
+    let mut resampled = Vec::<f32>::new();
+    // 诊断锚点：把「控制点声明」「URL 形状」「探测到的真实编码/采样率」「推算码率」打在一行。
+    // 显示用的码率就是这一行里的推算码率，出问题时直接看它是否等于 `字节 × 8 / 时长`。
+    log::info!(
+        "DLNA 质量诊断：mime={:?} 地址={}｜控制点声明：{}｜实际探测：编码={}(id={}) 采样率={}Hz 位深={} 声道={} 帧数={} 总字节={} 时长={}ms 推算码率={}bps｜输出采样率={}Hz",
+        track.mime,
+        url_shape(&track.url),
+        track.declared,
+        codec_name(&params),
+        params.codec,
+        sample_rate,
+        fmt_opt(params.bits_per_sample),
+        fmt_opt(params.channels.as_ref().map(Channels::count)),
+        fmt_opt(track_info.num_frames),
+        fmt_opt(total_bytes),
+        duration_ms,
+        bitrate,
+        output_rate,
+    );
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&params, &AudioDecoderOptions::default())
+        .context("不支持的音频编码")?;
+
     emit(
         events,
         UiEvent::StreamStarted {
-            codec: codec_label(track.mime.as_deref()).to_owned(),
+            codec: codec_display(&params, track.mime.as_deref()),
             sample_rate: u64::from(sample_rate),
         },
     );
@@ -513,6 +613,9 @@ fn decode(
     }
     let mut frames_done = 0_u64;
     let mut last_report = 0_u64;
+    let mut decode_failures = 0_u32;
+    // 流被判失效时已经发过 Warning，不再重复发「媒体流结束」，否则界面会同时报两件事。
+    let mut stream_lost = false;
     // 复用同一块交织缓冲，避免每个 packet 都分配。
     let mut block = Vec::<f32>::new();
 
@@ -521,14 +624,42 @@ fn decode(
             return Ok(());
         }
         // symphonia 0.6 的 `next_packet` 用 `Ok(None)` 表示流结束。
-        let Ok(Some(packet)) = format.next_packet() else {
-            break;
+        let packet = match format.next_packet() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
+            Err(error) => {
+                // 有些容器在正常结尾也会返回错误，所以只落日志、不弹到界面。
+                log::warn!("读取媒体包失败，结束本曲：{error}");
+                break;
+            }
         };
         if packet.track_id != track_id {
             continue;
         }
-        let Ok(decoded) = decoder.decode(&packet) else {
-            continue;
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => {
+                decode_failures = 0;
+                decoded
+            }
+            Err(error) => {
+                // 单个坏包（网络抖动 / 尾部填充）可以跳过；连续失败说明这条连接上跑的不再是我们在放的
+                // 那一路流——典型场景：控制点在手机上切成本机播放，投送代理把同一条 HTTP 连接换成别的流，
+                // 解码器于是持续报 `check failed`。这时必须停下并说明，否则只会无声地刷日志。
+                decode_failures += 1;
+                if decode_failures >= DECODE_FAILURE_LIMIT {
+                    emit(
+                        events,
+                        UiEvent::Warning {
+                            message: format!(
+                                "连续 {decode_failures} 个音频包无法解码，已停止本曲（媒体流可能已被控制点切换）：{error}"
+                            ),
+                        },
+                    );
+                    stream_lost = true;
+                    break;
+                }
+                continue;
+            }
         };
         let frames = decoded.frames() as u64;
         if frames_done + frames < seek_frames {
@@ -536,7 +667,14 @@ fn decode(
             continue;
         }
         interleave_into(&decoded, &mut block);
-        if !write(shared, generation, &block) {
+        let written = match resampler.as_mut() {
+            Some(resampler) => {
+                resampler.process(&block, &mut resampled);
+                write(shared, generation, &resampled)
+            }
+            None => write(shared, generation, &block),
+        };
+        if !written {
             return Ok(());
         }
         frames_done += frames;
@@ -555,7 +693,7 @@ fn decode(
         }
     }
 
-    if shared.is_current(generation) {
+    if !stream_lost && shared.is_current(generation) {
         emit(events, UiEvent::StreamClosed);
     }
     Ok(())
@@ -586,6 +724,62 @@ fn write(shared: &Shared, generation: u64, samples: &[f32]) -> bool {
         offset += take;
     }
     true
+}
+
+/// 把源采样率拉到输出采样率（流式、线性插值、跨 packet 连续）。
+///
+/// 为什么必须重采样：cpal 的输出流按**设备默认采样率**开（Windows 常见 48000），而解码出来的
+/// 是源采样率（常见 44100）。1:1 直送等于把 44100 的内容当 48000 播出去：速度快 8.8%、
+/// 音高整体升高（听感就是“加速 + 音色变了”）。
+///
+/// 只保留 1 帧跳包余量：`pending` 每次处理后就地丢弃已消费的整帧，内存与耗时都是 O(packet)，
+/// 且只在解码线程跑，音频回调里没有任何重采样开销。
+struct Resampler {
+    /// 每个输出帧消耗的源帧数（`src_rate / dst_rate`）。
+    step: f64,
+    /// 下一个输出帧在 `pending` 里的帧位置（帧为单位，可以是小数）。
+    position: f64,
+    /// 尚未消费完的输入帧（立体声交织——`interleave_into` 已统一成 2 声道）。
+    pending: Vec<f32>,
+}
+
+impl Resampler {
+    /// 新建一个重采样器（立体声交织，2 个 f32 为一帧）。
+    fn new(src_rate: u64, dst_rate: u64) -> Self {
+        Self {
+            step: src_rate as f64 / dst_rate as f64,
+            position: 0.0,
+            pending: Vec::new(),
+        }
+    }
+
+    /// 吃一段交织样本，把重采样结果写进 `out`（先清空；`out` 由调用方复用，避免每个 packet 分配）。
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        out.clear();
+        self.pending.extend_from_slice(input);
+        let frames = self.pending.len() / 2;
+        loop {
+            let index = self.position as usize;
+            if index + 1 >= frames {
+                break;
+            }
+            let fraction = (self.position - index as f64) as f32;
+            let head = index * 2;
+            let next = head + 2;
+            out.push(self.pending[head] + (self.pending[next] - self.pending[head]) * fraction);
+            out.push(
+                self.pending[head + 1]
+                    + (self.pending[next + 1] - self.pending[head + 1]) * fraction,
+            );
+            self.position += self.step;
+        }
+        // 保留最后一帧：下一次的输出可能落在它与新到的数据之间。
+        let consumed = (self.position as usize).saturating_sub(1);
+        if consumed > 0 {
+            self.pending.drain(..consumed * 2);
+            self.position -= consumed as f64;
+        }
+    }
 }
 
 /// 把解码结果整理成双声道交错 f32。
@@ -622,7 +816,8 @@ fn interleave_into(decoded: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>) {
     }
 }
 
-/// 流式媒体源：直接读 HTTP 响应；`seek` 用 `Range` 重连（服务端 206 时是 O(1)）。
+/// 流式媒体源：直接读 HTTP 响应；`seek` 优走 `Range` 重连（服务端 206 时是 O(1)）。
+/// 服务端忽略 `Range`（回 200）时，小文件整包缓存到内存，之后 seek/重读不再发请求。
 struct HttpSource {
     /// 原始地址（重连用）。
     url: String,
@@ -632,6 +827,9 @@ struct HttpSource {
     len: Option<u64>,
     /// 当前连接；`None` 表示尚未连接或已断开。
     reader: Option<Box<dyn std::io::Read + Send + Sync>>,
+    /// 整包缓存（仅服务端不支持 Range 且体积在上限内时填充）；有它在时 `reader` 不使用，
+    /// 读取与定位全部在内存里完成。
+    cache: Option<Vec<u8>>,
 }
 
 impl HttpSource {
@@ -641,6 +839,7 @@ impl HttpSource {
             pos: 0,
             len: None,
             reader: None,
+            cache: None,
         };
         source.connect()?;
         Ok(source)
@@ -681,18 +880,111 @@ impl HttpSource {
             }
         }
         log::info!(
-            "DLNA 拉流：{}（Range 支持：{}，长度：{:?}）",
+            "DLNA 拉流：{}（Range 支持：{}，长度：{:?}，Content-Type：{:?}）",
             self.pos,
             if status == 206 { "206" } else { "200 回退" },
-            self.len
+            self.len,
+            header("Content-Type"),
         );
-        self.reader = Some(Box::new(response.into_body().into_reader()));
+        let mut reader: Box<dyn std::io::Read + Send + Sync> =
+            Box::new(response.into_body().into_reader());
+        // 服务端无视 Range（回 200 而不是 206）时，正文是从第 0 字节开始的。
+        // ① 小文件：整包读进内存，之后 seek/重读都是纯内存操作（不再重下前缀）。
+        //    代价：这次是在解码线程上同步读完整个文件（12 MB/LAN 约 0.2~1 s），
+        //    会吃掉播放缓冲、产生一次可听空隙；换来之后所有 seek 都不再重下。
+        // ② 大文件：只能把前 `self.pos` 字节读掉丢掉，否则「位置」与「数据」错位——
+        //    解复用器从半路读到的不是它以为的字节，AAC 这类会直接校验失败。
+        if status != 206 && self.pos > 0 {
+            if let Some(len) = self
+                .len
+                .filter(|len| (1..=STREAM_CACHE_LIMIT).contains(len))
+            {
+                // 按声明长度截断读取：服务端谎报长度时也只吃 `len` 字节，不会无限放大内存。
+                let mut cache = Vec::with_capacity(len as usize);
+                let read = read_up_to(&mut *reader, len, &mut cache)
+                    .with_context(|| format!("缓存 {len} 字节的媒体流失败"))?;
+                if read != len {
+                    log::warn!(
+                        "DLNA 拉流：声明 {len} 字节但只读到 {}，按实际长度使用",
+                        cache.len()
+                    );
+                }
+                log::info!(
+                    "DLNA 拉流：服务端忽略 Range，已整包缓存 {} 字节（后续 seek 走内存）",
+                    cache.len()
+                );
+                self.cache = Some(cache);
+                self.reader = None;
+                return Ok(());
+            }
+            let skipped = skip_bytes(&mut *reader, self.pos)
+                .with_context(|| format!("跳过 {} 字节失败（服务端忽略 Range）", self.pos))?;
+            if skipped == self.pos {
+                log::info!("DLNA 拉流：服务端忽略 Range（200），已在本地跳过 {skipped} 字节");
+            } else {
+                log::warn!(
+                    "DLNA 拉流：服务端忽略 Range 且提前结束，只跳过了 {skipped}/{} 字节",
+                    self.pos
+                );
+            }
+        }
+        self.reader = Some(reader);
         Ok(())
     }
 }
 
+/// 读入最多 `limit` 字节到 `out`（整包缓存用；按声明长度截断，防止谎报长度放大内存）。
+///
+/// 返回实际读到的字节数：小于 `limit` 表示流提前结束，由调用方决定严重程度。
+fn read_up_to<R: std::io::Read + ?Sized>(
+    reader: &mut R,
+    limit: u64,
+    out: &mut Vec<u8>,
+) -> std::io::Result<u64> {
+    let mut scratch = [0_u8; HTTP_CHUNK];
+    let mut total = 0_u64;
+    while total < limit {
+        let want = (limit - total).min(HTTP_CHUNK as u64) as usize;
+        let read = reader.read(&mut scratch[..want])?;
+        if read == 0 {
+            break;
+        }
+        out.extend_from_slice(&scratch[..read]);
+        total += read as u64;
+    }
+    Ok(total)
+}
+
+/// 从流里丢弃 `count` 字节（服务端不支持 Range 时的本地补偿）。
+///
+/// 返回实际丢弃的字节数：读到 EOF 时小于 `count`，由调用方判断严重程度。
+/// 固定小缓冲，不分配，也不把数据留在内存里。
+fn skip_bytes<R: std::io::Read + ?Sized>(reader: &mut R, count: u64) -> std::io::Result<u64> {
+    // 块读，块大小只影响系统调用次数。
+    let mut scratch = [0_u8; HTTP_CHUNK];
+    let mut remaining = count;
+    while remaining > 0 {
+        let want = remaining.min(HTTP_CHUNK as u64) as usize;
+        let read = reader.read(&mut scratch[..want])?;
+        if read == 0 {
+            break;
+        }
+        remaining -= read as u64;
+    }
+    Ok(count - remaining)
+}
+
 impl std::io::Read for HttpSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // 整包缓存命中：直接从内存取，位置与数据天然对齐。
+        if let Some(cache) = self.cache.as_ref() {
+            let start = (self.pos as usize).min(cache.len());
+            let available = cache.len() - start;
+            let take = available.min(buf.len());
+            buf[..take].copy_from_slice(&cache[start..start + take]);
+            self.pos += take as u64;
+            return Ok(take);
+        }
         let Some(reader) = self.reader.as_mut() else {
             return Ok(0);
         };
@@ -715,6 +1007,10 @@ impl std::io::Seek for HttpSource {
             return Ok(target);
         }
         self.pos = target;
+        // 有整包缓存时 seek 是纯内存操作：不重连、不发请求。
+        if self.cache.is_some() {
+            return Ok(target);
+        }
         self.reader = None;
         self.connect()
             .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -759,7 +1055,46 @@ fn text_field(value: &serde_json::Value, key: &str) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-/// 把 MIME 翻译成人看得懂的编码名（symphonia 的 codec 字段是数字 ID）。
+/// `Option` → 诊断文本：缺失写 `-`（只给日志用，不在音频路径上）。
+fn fmt_opt<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
+}
+
+/// 探测出的真实编码名（`mp3` / `flac` / …）；注册表里没有就返回 `unknown`。
+///
+/// 这是 symphonia 按 codec id 查到的解码器名，与 DIDL 里声明的 mime 无关，
+/// 因此可以用它验证「显示成 MP3」到底是真 MP3 还是回退文案。
+fn codec_name(params: &AudioCodecParameters) -> &'static str {
+    symphonia::default::get_codecs()
+        .get_audio_decoder(params.codec)
+        .map_or("unknown", |registered| registered.codec.info.short_name)
+}
+
+/// 诊断用的 URL 形状：只留主机与路径后缀，丢弃查询串（里面有鉴权参数，不能落盘）。
+fn url_shape(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host = rest.split(['/', '?']).next().unwrap_or_default();
+    let path = rest.split('?').next().unwrap_or_default();
+    let suffix = path
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, suffix)| suffix)
+        .filter(|suffix| !suffix.is_empty() && suffix.len() <= 5)
+        .unwrap_or("-");
+    format!("{host} 后缀={suffix}")
+}
+
+/// 界面显示的编码名：优先用 symphonia 注册表里查到的**真实**编码名（`mp3` / `flac` / …），
+/// 查不到才退回 mime 猜测。旧实现只看 mime，缺失时一律兜底成 `MP3`，会把 FLAC 显示错。
+fn codec_display(params: &AudioCodecParameters, mime: Option<&str>) -> String {
+    match codec_name(params) {
+        "unknown" => codec_label(mime).to_owned(),
+        name => name.to_ascii_uppercase(),
+    }
+}
+
+/// mime → 编码名（仅作 [`codec_display`] 的回退，不参与正常路径）。
 fn codec_label(mime: Option<&str>) -> &'static str {
     let lowered = mime.unwrap_or_default().to_ascii_lowercase();
     if lowered.contains("flac") {
@@ -822,6 +1157,9 @@ fn build_stream(shared: Arc<Shared>, requested: Option<&str>) -> Result<(cpal::S
     let channels = usize::from(config.channels).max(1);
     // 缓冲在开流前一次性按上限预留，之后只 push/pop，音频回调里绝不触发扩容。
     let capacity = (config.sample_rate as usize / 1000) * BUFFER_MS * channels;
+    shared
+        .output_rate
+        .store(config.sample_rate, Ordering::Release);
     if let Ok(mut guard) = shared.sink.lock() {
         guard.capacity = capacity;
         guard.buffer = VecDeque::with_capacity(capacity);
@@ -861,6 +1199,12 @@ fn build_stream(shared: Arc<Shared>, requested: Option<&str>) -> Result<(cpal::S
     }
     .context("无法创建音频输出流")?;
     let device_name = audio::device_name(&device).unwrap_or_else(|| "系统默认输出".to_owned());
+    // 输出流按设备默认采样率跑；源采样率不同时由解码线程重采样，这一行是排查变调/变速的锚点。
+    log::info!(
+        "音频输出：{device_name}｜{} Hz｜{} 声道｜{format:?}",
+        config.sample_rate,
+        config.channels
+    );
     Ok((stream, device_name))
 }
 
@@ -893,7 +1237,32 @@ fn fill(shared: &Shared, out: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{codec_label, unit_to_i16};
+    use super::{
+        DeclaredQuality, HttpSource, Resampler, codec_display, codec_label, codec_name, fmt_opt,
+        read_up_to, skip_bytes, unit_to_i16, url_shape,
+    };
+    use serde_json::json;
+    use std::io::{Read as _, Seek as _};
+    use symphonia::core::codecs::audio::AudioCodecParameters;
+
+    #[test]
+    fn codec_display_prefers_the_probed_codec() {
+        use symphonia::core::codecs::audio::well_known::{CODEC_ID_FLAC, CODEC_ID_MP3};
+        let mut params = AudioCodecParameters {
+            codec: CODEC_ID_MP3,
+            ..AudioCodecParameters::default()
+        };
+        assert_eq!(codec_display(&params, Some("audio/mpeg")), "MP3");
+        // probe 与 mime 冲突时以 probe 为准：旧实现照 mime 显示，会把 FLAC 报成 MP3。
+        params.codec = CODEC_ID_FLAC;
+        assert_eq!(codec_display(&params, Some("audio/mpeg")), "FLAC");
+        // 注册表查不到时退回 mime；mime 也没有才沿用旧的 MP3 兜底。
+        assert_eq!(
+            codec_display(&AudioCodecParameters::default(), Some("audio/flac")),
+            "FLAC"
+        );
+        assert_eq!(codec_display(&AudioCodecParameters::default(), None), "MP3");
+    }
 
     #[test]
     fn codec_label_follows_mime() {
@@ -913,5 +1282,192 @@ mod tests {
         assert_eq!(unit_to_i16(-1.0), -i16::MAX);
         assert_eq!(unit_to_i16(2.0), i16::MAX);
         assert_eq!(unit_to_i16(-2.0), -i16::MAX);
+    }
+
+    #[test]
+    fn declared_quality_reads_dlna_media_fields() {
+        let declared = DeclaredQuality::from_event(&json!({
+            "type": "dlna_media",
+            "url": "https://example.test/a.mp3",
+            "bitrate_bps": 1_411_200,
+            "sample_rate": 96_000,
+            "bits_per_sample": 24,
+            "channels": 2,
+            "duration_ms": 185_250,
+        }));
+        assert_eq!(declared.bitrate_bps, Some(1_411_200));
+        assert_eq!(declared.sample_rate, Some(96_000));
+        assert_eq!(declared.bits_per_sample, Some(24));
+        assert_eq!(declared.channels, Some(2));
+        assert_eq!(declared.duration_ms, Some(185_250));
+        assert_eq!(
+            declared.to_string(),
+            "码率=1411200 采样率=96000 位深=24 声道=2 时长=185250ms"
+        );
+    }
+
+    #[test]
+    fn declared_quality_keeps_missing_fields_empty() {
+        let declared = DeclaredQuality::from_event(&json!({"type": "dlna_media"}));
+        assert_eq!(declared.bitrate_bps, None);
+        assert_eq!(
+            declared.to_string(),
+            "码率=- 采样率=- 位深=- 声道=- 时长=-ms"
+        );
+    }
+
+    #[test]
+    fn url_shape_drops_credentials_and_query() {
+        // 播放地址带鉴权串，日志只能留主机 + 后缀。
+        assert_eq!(
+            url_shape("https://m701.music.126.net/20240101/abc/track.mp3?auth=secret"),
+            "m701.music.126.net 后缀=mp3"
+        );
+        assert_eq!(
+            url_shape("http://192.168.1.5:8080/"),
+            "192.168.1.5:8080 后缀=-"
+        );
+    }
+
+    #[test]
+    fn resampler_passes_through_when_rates_match() {
+        let mut resampler = Resampler::new(44_100, 44_100);
+        let mut out = Vec::new();
+        let input = [0.0_f32, 1.0, 0.25, 0.5, 0.75, 0.125];
+        resampler.process(&input, &mut out);
+        // 采样率相同时（真实路径不会创建它）也必须原样输出，只差末尾留作余量的一帧。
+        assert!(out.len() >= input.len() - 2);
+        assert!((out[0] - input[0]).abs() < 1e-6);
+        assert!((out[1] - input[1]).abs() < 1e-6);
+        assert!((out[2] - input[2]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resampler_matches_the_output_timeline() {
+        // 0.1 s 的源素材，重采样后时长必须还是 0.1 s（帧数 = 秒数 × 输出采样率）。
+        for (src, dst, input_frames) in [(44_100_u64, 48_000_u64, 4_410), (48_000, 44_100, 4_800)] {
+            let mut resampler = Resampler::new(src, dst);
+            let mut out = Vec::new();
+            resampler.process(&vec![0.1_f32; input_frames * 2], &mut out);
+            let expected = (input_frames as f64 * dst as f64 / src as f64) as usize;
+            assert!(
+                (out.len() / 2).abs_diff(expected) <= 3,
+                "{src} → {dst}：{} 帧，期望 {expected}",
+                out.len() / 2
+            );
+        }
+    }
+
+    #[test]
+    fn resampler_keeps_the_timeline_across_packets() {
+        // 分块送入与一次性送入必须得到同样长度的输出，否则长曲会持续跑偏。
+        let input = vec![0.25_f32; 4_410 * 2];
+        let mut once = Resampler::new(44_100, 48_000);
+        let mut once_out = Vec::new();
+        once.process(&input, &mut once_out);
+
+        let mut chunked = Resampler::new(44_100, 48_000);
+        let mut chunked_out = Vec::new();
+        for chunk in input.chunks(1_024 * 2) {
+            let mut out = Vec::new();
+            chunked.process(chunk, &mut out);
+            chunked_out.extend_from_slice(&out);
+        }
+        assert!(
+            once_out.len().abs_diff(chunked_out.len()) <= 3,
+            "一次 {} vs 分块 {}",
+            once_out.len(),
+            chunked_out.len()
+        );
+    }
+
+    #[test]
+    fn resampler_keeps_a_sine_intact() {
+        // 线性插值对 441 Hz 这种低频几乎不衰减，也不应产生 NaN/削顶。
+        let frames = 4_410_usize;
+        let mut input = Vec::with_capacity(frames * 2);
+        for index in 0..frames {
+            let value = (std::f32::consts::TAU * 441.0 * index as f32 / 44_100.0).sin();
+            input.push(value);
+            input.push(value);
+        }
+        let mut resampler = Resampler::new(44_100, 48_000);
+        let mut out = Vec::new();
+        resampler.process(&input, &mut out);
+        let peak = out
+            .iter()
+            .fold(0.0_f32, |peak, value| peak.max(value.abs()));
+        assert!(out.iter().all(|value| value.is_finite()));
+        assert!((0.98..=1.0).contains(&peak), "peak = {peak}");
+    }
+
+    #[test]
+    fn skip_bytes_reads_exactly_the_prefix() {
+        let data = [1_u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut reader: &[u8] = &data;
+        assert_eq!(skip_bytes(&mut reader, 3).unwrap(), 3);
+        // 跳过后从正确位置继续读：服务端忽略 Range 时靠这一步维持位置对齐。
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, [4_u8, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn read_up_to_stops_at_the_limit_or_at_eof() {
+        let data = [1_u8, 2, 3, 4, 5, 6];
+        let mut reader: &[u8] = &data;
+        let mut out = Vec::new();
+        // limit 小于数据量：只读 limit，剩余留给后续读取（缓存分支不会越界吃内存）。
+        assert_eq!(read_up_to(&mut reader, 4, &mut out).unwrap(), 4);
+        assert_eq!(out, [1_u8, 2, 3, 4]);
+
+        let mut short = Vec::new();
+        assert_eq!(read_up_to(&mut reader, 10, &mut short).unwrap(), 2);
+        assert_eq!(short, [5_u8, 6]);
+    }
+
+    #[test]
+    fn skip_bytes_stops_at_eof() {
+        let data = [1_u8, 2, 3];
+        let mut reader: &[u8] = &data;
+        // 要求跳得比数据多：返回实际丢弃量，由调用方判断。
+        assert_eq!(skip_bytes(&mut reader, 10).unwrap(), 3);
+        assert_eq!(skip_bytes(&mut reader, 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn cached_source_seeks_in_memory() {
+        // 整包缓存后：读取与 seek 都不再碰网络，也不会越界 panic。
+        let mut source = HttpSource {
+            url: "http://example.test/a.mp3".to_owned(),
+            pos: 0,
+            len: Some(4),
+            reader: None,
+            cache: Some(vec![1, 2, 3, 4]),
+        };
+        let mut head = [0_u8; 4];
+        source.read_exact(&mut head).unwrap();
+        assert_eq!(head, [1, 2, 3, 4]);
+
+        assert_eq!(source.seek(std::io::SeekFrom::Start(1)).unwrap(), 1);
+        let mut rest = Vec::new();
+        source.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, [2, 3, 4]);
+
+        // 越过末尾：读到 EOF，不 panic。
+        assert_eq!(source.seek(std::io::SeekFrom::Start(99)).unwrap(), 99);
+        assert_eq!(source.read(&mut head).unwrap(), 0);
+    }
+
+    #[test]
+    fn unknown_codec_id_has_no_name() {
+        // 默认参数里的 codec id 是 null codec，注册表查不到 → 必须落到 unknown，而不是 panic。
+        assert_eq!(codec_name(&AudioCodecParameters::default()), "unknown");
+    }
+
+    #[test]
+    fn optional_marks_missing_values() {
+        assert_eq!(fmt_opt(None::<u64>), "-");
+        assert_eq!(fmt_opt(Some(44_100_u32)), "44100");
     }
 }
