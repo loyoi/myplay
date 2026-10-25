@@ -30,4 +30,6 @@ tokio = { workspace = true, features = [
     "sync",
     "time",
 ] }
-tracing = { workspace = true }
+# `log` feature：把本 crate 的 tracing 事件桥接到 myplay 的 env_logger。
+# 没有它，下面所有 `tracing::warn!/debug!` 都是不输出的（宿主只装了 env_logger）。
+tracing = { workspace = true, features = ["log"] }

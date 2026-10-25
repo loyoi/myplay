@@ -35,6 +35,11 @@ MediaRemote event channel、RTSP 分帧等十余项补丁）。crates.io 上的 
   内部 path 依赖（`fusionplay-miplay-sdk`、`if-addrs`）的路径只在根表声明。
 - 依赖升级适配：`rand 0.10`（`rand::thread_rng()` → `rand::rng()` / `rand::fill`）、
   `tokio` / `serde` 按根表版本。
+- 日志打通：宿主（`crates/myplay`）只装了 `env_logger`（`log` 门面），而本 crate 一直用
+  `tracing`，因此所有 `tracing::warn!/debug!` 都不会输出。现在给 `tracing` 打开 `log` feature
+  把事件桥接到 `log`，并沿用 `tracing` 写日志：控制点请求（`SetAVTransportURI` / `Play` /
+  `Pause` / `Stop` / `Seek` / 音量，轮询类查询不记）与 GENA 首次订阅/退订各打一行
+  `tracing::info!`，用于排查「控制点切到本机播放却不发 Stop」。
 - 移除 `[[bin]]` 两个可执行目标（`airplay-receiver-core`、`miplay-host`）及 `src/main.rs`、
   `src/bin/`：桌面宿主由 `crates/myplay` 提供。
 - 移除 `[patch.crates-io]` 与 `[profile.release]`：前者只能在根清单生效，后者由根统一决策。

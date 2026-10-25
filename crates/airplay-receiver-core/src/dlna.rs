@@ -2071,21 +2071,26 @@ fn route_http_request(
             request,
             HttpResponse::xml(200, "OK", CONNECTION_MANAGER_SCPD.to_owned()),
         ),
-        ("POST", "/upnp/control/avtransport") => {
-            route_soap(request, AV_TRANSPORT_TYPE, |action, arguments| {
+        ("POST", "/upnp/control/avtransport") => route_soap(
+            request,
+            peer.ip(),
+            AV_TRANSPORT_TYPE,
+            |action, arguments| {
                 handle_av_transport(&context.controller, peer.ip(), action, arguments)
-            })
-        }
-        ("POST", "/upnp/control/renderingcontrol") => {
-            route_soap(request, RENDERING_CONTROL_TYPE, |action, arguments| {
-                handle_rendering_control(&context.controller, action, arguments)
-            })
-        }
-        ("POST", "/upnp/control/connectionmanager") => {
-            route_soap(request, CONNECTION_MANAGER_TYPE, |action, arguments| {
-                handle_connection_manager(&context.controller, action, arguments)
-            })
-        }
+            },
+        ),
+        ("POST", "/upnp/control/renderingcontrol") => route_soap(
+            request,
+            peer.ip(),
+            RENDERING_CONTROL_TYPE,
+            |action, arguments| handle_rendering_control(&context.controller, action, arguments),
+        ),
+        ("POST", "/upnp/control/connectionmanager") => route_soap(
+            request,
+            peer.ip(),
+            CONNECTION_MANAGER_TYPE,
+            |action, arguments| handle_connection_manager(&context.controller, action, arguments),
+        ),
         ("SUBSCRIBE", path) if service_from_event_path(path).is_some() => {
             let service = service_from_event_path(path).expect("guarded service path");
             handle_subscribe(request, peer, context, service)
@@ -2116,6 +2121,12 @@ fn handle_subscribe(
     let initial_body = initial_event_body(service, &context.controller);
     match context.gena.subscribe(service, request, peer, initial_body) {
         Ok((sid, timeout_seconds)) => {
+            // 续订（带 SID）不记，否则每几分钟一条；新建订阅和退订才是“控制点来去”的信号。
+            if !request.headers.contains_key("sid") {
+                tracing::info!(
+                    "DLNA 事件订阅：{service:?}（来自 {peer}，超时 {timeout_seconds} 秒）"
+                );
+            }
             let mut response = HttpResponse::plain(200, "OK", String::new());
             response.headers.push(("SID".to_owned(), sid));
             response
@@ -2133,7 +2144,10 @@ fn handle_unsubscribe(
     service: ServiceKind,
 ) -> HttpResponse {
     match context.gena.unsubscribe(service, request) {
-        Ok(()) => HttpResponse::plain(200, "OK", String::new()),
+        Ok(()) => {
+            tracing::info!("DLNA 事件退订：{service:?}");
+            HttpResponse::plain(200, "OK", String::new())
+        }
         Err(message) => HttpResponse::plain(412, "Precondition Failed", message.to_owned()),
     }
 }
@@ -2147,6 +2161,7 @@ fn response_for_head(request: &HttpRequest, mut response: HttpResponse) -> HttpR
 
 fn route_soap(
     request: &HttpRequest,
+    peer: IpAddr,
     service_type: &str,
     handler: impl FnOnce(&str, &HashMap<String, String>) -> SoapResult,
 ) -> HttpResponse {
@@ -2157,6 +2172,11 @@ fn route_soap(
     else {
         return soap_fault(401, "Invalid Action");
     };
+    // 只记会改变接收行为的请求（GetPositionInfo 这类轮询每秒都来，记了只会淹掉日志）。
+    // 用途：判断“控制点切成本机播放后到底有没有发 Stop”。
+    if is_stateful_action(&action) {
+        tracing::info!("DLNA 控制点请求：{action}（来自 {peer}）");
+    }
     let Ok(body) = std::str::from_utf8(&request.body) else {
         return soap_fault(402, "Invalid Args");
     };
@@ -2165,6 +2185,23 @@ fn route_soap(
         Ok(values) => HttpResponse::xml(200, "OK", soap_success(service_type, &action, &values)),
         Err(error) => soap_fault(error.code, error.description),
     }
+}
+
+/// 会改变传输/音量状态的控制点动作（轮询类查询一律不算）。
+fn is_stateful_action(action: &str) -> bool {
+    matches!(
+        action,
+        "SetAVTransportURI"
+            | "SetNextAVTransportURI"
+            | "Play"
+            | "Pause"
+            | "Stop"
+            | "Seek"
+            | "Next"
+            | "Previous"
+            | "SetVolume"
+            | "SetMute"
+    )
 }
 
 fn parse_soap_action(value: &str) -> Option<String> {
