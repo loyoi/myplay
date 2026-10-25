@@ -183,7 +183,7 @@ pub struct Core {
     pub tracks: u32,
     /// 只读：媒体流重建次数。
     pub reconnects: u32,
-    /// 首次打开窗口时是否自动最小化；只生效一次。
+    /// 本次启动是否只驻留托盘（不建窗口）；只生效一次。
     start_minimized_pending: bool,
     /// 封面下载请求入口（下载线程串行处理并合并连续换曲）。
     artwork_request_tx: flume::Sender<String>,
@@ -308,7 +308,10 @@ impl Core {
         if self.channel.is_some() {
             self.stop(cx);
         }
+        // 启停按钮的另一半职责：记下「要开着」，下次启动按它还原。
+        self.remember_running(true);
         self.set_status(RunState::Starting);
+        let source = self.settings.source.label();
         match channels::start(self.settings.source, &self.settings, self.sink.clone()) {
             Ok(channel) => {
                 self.snapshot = channel.snapshot().cloned();
@@ -321,13 +324,15 @@ impl Core {
                 self.peer.clear();
                 self.stage.clear();
                 self.active_output = None;
-                self.push_log("接收器已启动");
+                self.push_log(format!("接收器已启动（{source}）"));
+                log::info!("接收器已启动（{source}）");
                 self.channel = Some(channel);
             }
             Err(error) => {
                 self.set_status(RunState::Failed);
                 self.detail = format!("{error:#}");
-                self.push_log(format!("启动失败：{error:#}"));
+                self.push_log(format!("启动{source}失败：{error:#}"));
+                log::info!("启动{source}失败：{error:#}");
             }
         }
         self.changed(cx);
@@ -335,6 +340,19 @@ impl Core {
 
     /// 停止接收器（幂等：没有通道、状态机也不允许停止时直接返回）。
     pub fn stop(&mut self, cx: &mut Context<Self>) {
+        self.stop_channel(true, cx);
+    }
+
+    /// 退出前收尾：停通道（发 byebye）但**保留**「上次是运行状态」，下次启动照旧还原。
+    pub fn shutdown(&mut self, cx: &mut Context<Self>) {
+        self.stop_channel(false, cx);
+    }
+
+    /// `remember` 为真时把「不再运行」也落盘（用户真的点了停止）；退出/重启传 `false`。
+    fn stop_channel(&mut self, remember: bool, cx: &mut Context<Self>) {
+        if remember {
+            self.remember_running(false);
+        }
         // 启动失败时通道已经不在，但这仍是一次有效的「拉回 Idle」请求。
         if self.channel.is_none() && !self.status.can_stop() {
             return;
@@ -354,7 +372,9 @@ impl Core {
         self.active_output = None;
         self.tracks = 0;
         self.reconnects = 0;
-        self.push_log("接收器已停止");
+        let source = self.settings.source.label();
+        self.push_log(format!("接收器已停止（{source}）"));
+        log::info!("接收器已停止（{source}）");
         self.changed(cx);
     }
 
@@ -377,7 +397,7 @@ impl Core {
         self.is_running().then_some(self.settings.source)
     }
 
-    /// 首次打开窗口时按配置最小化；只生效一次，重开窗口不再自动最小化。
+    /// 本次启动是否跳过开窗（「启动后最小化到托盘」）；只生效一次，之后开窗不再跳过。
     pub fn take_start_minimized(&mut self) -> bool {
         std::mem::take(&mut self.start_minimized_pending)
     }
@@ -395,9 +415,8 @@ impl Core {
         if self.settings.source == source {
             return;
         }
-        self.settings.source = source;
-        self.settings.save();
-        self.restart_if_running(cx);
+        // 停止要在改配置之前：日志里「已停止（妙播）」记的必须是真正在跑的那个源。
+        self.restart_if_running(move |core| core.settings.source = source, cx);
     }
 
     /// 切换广播设备类型（下次启动生效）。
@@ -425,9 +444,7 @@ impl Core {
         if self.settings.output_device == id {
             return;
         }
-        self.settings.output_device = id;
-        self.settings.save();
-        self.restart_if_running(cx);
+        self.restart_if_running(move |core| core.settings.output_device = id, cx);
     }
 
     /// 开关开机自启：写盘 + 操作注册表 + 记日志。
@@ -625,14 +642,31 @@ impl Core {
         self.status = next;
     }
 
-    /// 运行中则「停 → 起」，否则只刷新界面。
-    fn restart_if_running(&mut self, cx: &mut Context<Self>) {
-        if self.is_running() {
-            self.stop(cx);
+    /// 运行中则「按旧配置停 → 改配置并落盘 → 再起」，否则只落盘并刷新界面。
+    ///
+    /// 先停再改：停止日志里记的才是真正在跑的那个源；重启不是「用户停止」，
+    /// 所以不碰还原状态，也不多写一次配置。
+    fn restart_if_running(&mut self, apply: impl FnOnce(&mut Self), cx: &mut Context<Self>) {
+        let running = self.is_running();
+        if running {
+            self.stop_channel(false, cx);
+        }
+        apply(self);
+        self.settings.save();
+        if running {
             self.start(cx);
         } else {
             cx.notify();
         }
+    }
+
+    /// 记下启停按钮的状态（下次启动按它还原）；只落盘，不触发重绘。
+    fn remember_running(&mut self, running: bool) {
+        if self.settings.restore_running == running {
+            return;
+        }
+        self.settings.restore_running = running;
+        self.settings.save();
     }
 
     /// 状态变化后的统一收尾：刷新界面 + 回传托盘。

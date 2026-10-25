@@ -126,8 +126,10 @@ pub struct Settings {
     pub output_device: String,
     /// 是否开机自启（`HKCU\...\Run` 下的 `myplay` 值）。
     pub start_with_windows: bool,
-    /// 首次打开窗口是否自动最小化到托盘。
+    /// 启动后是否只驻留托盘（不打开主窗口）；点托盘图标再打开。
     pub start_minimized: bool,
+    /// 上次关软件时接收器在运行：下次启动按这个状态还原（启停按钮自动记下）。
+    pub restore_running: bool,
     /// 关闭窗口时的行为。
     pub close_action: CloseAction,
     /// 是否输出 debug 级日志（下次启动生效）。
@@ -149,6 +151,7 @@ impl Default for Settings {
             output_device: String::new(),
             start_with_windows: false,
             start_minimized: false,
+            restore_running: false,
             close_action: CloseAction::default(),
             verbose_log: false,
             log_file: String::new(),

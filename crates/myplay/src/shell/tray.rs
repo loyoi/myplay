@@ -4,6 +4,8 @@
 //! 经 flume 通道送到 GPUI 侧的任务；托盘线程不直接操作窗口，避免跨线程依赖 GPUI。
 //! 反方向：GPUI 侧的 [`Core`](crate::core::app::Core) 把状态压成
 //! [`StatusSummary`] 回传，托盘只拿它刷新 tooltip，不持有任何业务状态。
+//! 另一条输入：每轮顺手看一眼单实例的 [`WakeSignal`]（重复启动留下的标记），
+//! 有就直接当成「显示窗口」。
 
 use std::time::Duration;
 
@@ -13,6 +15,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconEvent};
 
 use crate::core::app::StatusSummary;
+use crate::platform::single_instance::WakeSignal;
 use crate::shell::window::APP_TITLE;
 
 /// 托盘发出的命令。
@@ -32,15 +35,17 @@ pub enum TrayCommand {
 
 /// 启动托盘线程。
 ///
-/// `commands` 是托盘 → GPUI 的意图通道；`status` 是 GPUI → 托盘的显示回传通道。
+/// `commands` 是托盘 → GPUI 的意图通道；`status` 是 GPUI → 托盘的显示回传通道；
+/// `wake` 是「另一个实例请求显示窗口」的轮询点。
 pub fn spawn(
     commands: flume::Sender<TrayCommand>,
     status: flume::Receiver<StatusSummary>,
+    wake: WakeSignal,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name("myplay-tray".to_owned())
         .spawn(move || {
-            if let Err(error) = run(commands, status) {
+            if let Err(error) = run(commands, status, wake) {
                 log::error!("托盘初始化失败：{error:#}");
             }
         })
@@ -48,7 +53,11 @@ pub fn spawn(
     Ok(())
 }
 
-fn run(commands: flume::Sender<TrayCommand>, status: flume::Receiver<StatusSummary>) -> Result<()> {
+fn run(
+    commands: flume::Sender<TrayCommand>,
+    status: flume::Receiver<StatusSummary>,
+    wake: WakeSignal,
+) -> Result<()> {
     let show_item = MenuItem::new("显示窗口", true, None);
     let start_item = MenuItem::new("启动接收器", true, None);
     let stop_item = MenuItem::new("停止接收器", true, None);
@@ -121,7 +130,7 @@ fn run(commands: flume::Sender<TrayCommand>, status: flume::Receiver<StatusSumma
         .context("创建托盘图标失败")?;
 
     log::info!("托盘已就绪");
-    pump_messages(&tray, &status);
+    pump_messages(&tray, &status, &wake, &commands);
     Ok(())
 }
 
@@ -166,8 +175,13 @@ fn build_icon() -> Vec<u8> {
 /// Windows 消息循环：tray-icon / muda 的事件依赖它派发。
 ///
 /// 用 `PeekMessageW` 轮询而不是 `GetMessageW` 阻塞：每轮顺手把最新状态
-/// 写进 tooltip，没有消息时睡一小会儿（100 ms，几乎不占 CPU）。
-fn pump_messages(tray: &TrayIcon, status: &flume::Receiver<StatusSummary>) {
+/// 写进 tooltip、看一眼单实例的唤醒标记，没有消息时睡一小会儿（100 ms，几乎不占 CPU）。
+fn pump_messages(
+    tray: &TrayIcon,
+    status: &flume::Receiver<StatusSummary>,
+    wake: &WakeSignal,
+    commands: &flume::Sender<TrayCommand>,
+) {
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_QUIT,
     };
@@ -195,6 +209,11 @@ fn pump_messages(tray: &TrayIcon, status: &flume::Receiver<StatusSummary>) {
             && let Err(error) = tray.set_tooltip(Some(summary.tooltip()))
         {
             log::warn!("托盘 tooltip 更新失败：{error:#}");
+        }
+
+        // 另一个实例刚启动过：它留下的标记就是「把窗口叫出来」。
+        if wake.take() {
+            let _ = commands.send(TrayCommand::ShowWindow);
         }
 
         std::thread::sleep(Duration::from_millis(100));

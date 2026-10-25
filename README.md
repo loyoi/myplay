@@ -13,7 +13,10 @@ cargo run -p myplay   # 在仓库根直接 `cargo run` 等价（根是虚拟工�
 | 设置 → 启动源 | 小米妙播（AAC 256k）/ DLNA（FLAC/WAV 可无损） |
 | 设置 → 输出设备 | 下拉选择系统输出设备（切换后自动重启接收器） |
 | 关闭窗口 | 窗口销毁，进程驻留托盘；点托盘图标重新打开，状态不丢 |
+| 启动状态 | 启停按钮的状态会记住：上次关软件时接收器开着，下次启动自动回到运行（参数不变） |
 | 托盘图标 | 左键打开窗口（已在就激活，不会重复开窗）；右键出菜单 |
+| 启动后最小化 | 开启时启动不显示窗口，只留托盘图标；点托盘左键再打开界面 |
+| 重复启动 | 已有进程在跑时再次启动只把那个实例的窗口叫出来，不会再起第二个进程 |
 
 ## 架构
 
@@ -41,6 +44,22 @@ cargo check --all-targets                       # 只校验应用（默认成员
 cargo check --workspace --all-targets           # 连三份内置源码一起校验
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## 发布
+
+版本号只有一处来源：`crates/myplay/Cargo.toml` 的 `[package] version`；更新记录写在
+[CHANGELOG.md](CHANGELOG.md)。两者都改好后，在仓库根执行一条命令：
+
+```powershell
+just release
+```
+
+脚本先校验：在 `master` 分支、`gh` 已登录、`CHANGELOG.md` 里有 `## <版本号>` 段落且非空、
+`v<版本号>` tag 本地与远端都不存在、GitHub 上没有同名 Release。通过后打印版本、tag、产物与
+更新内容摘要，**回车确认**才开始：release 构建 → 打包
+`target/dist/myplay-<版本>-windows-x64.zip` → 提交 `Cargo.toml` / `Cargo.lock` / `CHANGELOG.md` →
+打 tag 并推送到 `github` remote → `gh release create` 上传产物并打印 Release 地址。
+工作区里其它未提交改动不会被提交。
 
 ## 内置源码与上游来源
 

@@ -1,1 +1,4 @@
-IDI_ICON1 ICON "myplay.ico"
+// 资源 ID 必须是数字 1：GPUI 的 Windows 后端用 LoadImageW(module, PCWSTR(1), ...) 取窗口图标，
+// 用资源名（如 IDI_ICON1）声明的 ICON 它取不到，标题栏就会退化成系统默认图标。
+// 同时它也是资源管理器/任务栏上 exe 的图标来源。
+1 ICON "myplay.ico"

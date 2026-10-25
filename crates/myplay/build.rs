@@ -1,6 +1,9 @@
-//! 把图标嵌入 exe 资源：Windows 的任务栏/标题栏图标取自 exe 的第一个 ICON 资源。
+//! 把图标嵌入 exe 资源：exe 文件图标与 GPUI 窗口（标题栏 / 任务栏）图标都取自这里。
 //!
-//! gpui 没有设置窗口图标的 API，所以走资源嵌入这条路；本文件只在 Windows 上做事。
+//! GPUI 的 Windows 后端没有设置窗口图标的 API，它是在启动时用
+//! `LoadImageW(module, PCWSTR(1), ...)` 取 **编号 1** 的 ICON 资源注册成窗口类图标；
+//! 所以 `assets/myplay.rc` 里的资源 ID 必须是数字 `1`（用名字声明它取不到，标题栏就退化成默认图标）。
+//! 本文件只在 Windows 上做事。
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/myplay.rc");

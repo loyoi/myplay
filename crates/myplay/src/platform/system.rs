@@ -2,6 +2,7 @@
 //!
 //! 开机自启用 HKCU 的 Run 键（不需要管理员）。事件日志由独立的写线程持有句柄
 //! （见 [`LogWriter`]），避免每写一行都 open/close 一次，也避免阻塞界面线程。
+//! 另外提供一条诊断查询：[`foreground_window`]（当前前台窗口是谁）。
 
 use std::io::Write as _;
 use std::path::Path;
@@ -87,6 +88,89 @@ impl LogWriter {
             }
         }
     }
+}
+
+/// 当前前台窗口的「类名 / 标题」，只给抢失败时的日志用。
+fn foreground_window() -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowTextW,
+    };
+
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return "（无前台窗口）".to_owned();
+    }
+
+    let mut class = [0_u16; 128];
+    let mut title = [0_u16; 256];
+    let class_len = unsafe { GetClassNameW(hwnd, &mut class) };
+    let title_len = unsafe { GetWindowTextW(hwnd, &mut title) };
+
+    let text = |buffer: &[u16], len: i32| {
+        let len = len.clamp(0, buffer.len() as i32) as usize;
+        String::from_utf16_lossy(&buffer[..len])
+    };
+    format!("{} / {}", text(&class, class_len), text(&title, title_len))
+}
+
+/// 把标题为 `title` 的窗口强行切到前台。
+///
+/// Windows 只允许「前台进程 / 刚收到输入」的进程抢前台：从终端或 IDE 启动时两个条件
+/// 都不满足，`SetForegroundWindow` 会被拒，表现就是窗口闪一下就退到后面。
+/// 这里把本线程挂到当前前台线程的输入队列上（`AttachThreadInput`）借它的权限，
+/// 拿到后立刻解除挂接；实在拿不到就临时 topmost 把窗口顶到 Z 序最前，至少让人看得见。
+///
+/// 返回窗口是否已经成为前台。
+pub fn force_foreground(title: &str) -> bool {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, FindWindowW, GetForegroundWindow, GetWindowThreadProcessId, HWND_NOTOPMOST,
+        HWND_TOPMOST, IsIconic, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow,
+        SetWindowPos, ShowWindowAsync,
+    };
+    use windows::core::PCWSTR;
+
+    let name: Vec<u16> = title.encode_utf16().chain([0]).collect();
+    let hwnd = match unsafe { FindWindowW(PCWSTR::null(), PCWSTR(name.as_ptr())) } {
+        Ok(hwnd) => hwnd,
+        Err(error) => {
+            log::warn!("抢前台：找不到标题为「{title}」的窗口（{error}）");
+            return false;
+        }
+    };
+
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground == hwnd {
+        return true;
+    }
+    if unsafe { IsIconic(hwnd).as_bool() } {
+        let _ = unsafe { ShowWindowAsync(hwnd, SW_RESTORE).ok() };
+    }
+
+    let foreground_thread = unsafe { GetWindowThreadProcessId(foreground, None) };
+    let this_thread = unsafe { GetCurrentThreadId() };
+    let attached = foreground_thread != 0
+        && foreground_thread != this_thread
+        && unsafe { AttachThreadInput(this_thread, foreground_thread, true).as_bool() };
+    let activated = unsafe { SetForegroundWindow(hwnd).as_bool() };
+    if attached {
+        let _ = unsafe { AttachThreadInput(this_thread, foreground_thread, false).ok() };
+    }
+    if activated || unsafe { GetForegroundWindow() } == hwnd {
+        return true;
+    }
+
+    // 仍然被拒：临时 topmost 把窗口顶到前面（不解激活，只是不躲在后面）。
+    unsafe {
+        BringWindowToTop(hwnd).ok();
+        SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE).ok();
+        SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE).ok();
+    }
+    log::warn!(
+        "抢前台被拒（前台窗口仍是：{}），已把窗口顶到最前但没拿到焦点",
+        foreground_window()
+    );
+    false
 }
 
 #[cfg(test)]

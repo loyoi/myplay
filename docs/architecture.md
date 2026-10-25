@@ -49,7 +49,8 @@ crates/fusionplay-if-addrs/     # if-addrs 适配层，crate 名仍为 if-addrs�
 ## 已完成
 
 - **L2**：`shell/tray.rs`（托盘线程 + 右键菜单 + 代码生成图标 + tooltip 回传刷新，左键只开窗口）、
-  `shell/window.rs`（`SharedView` 全局、`APP_TITLE`、单例 `open_main_window`：已在则激活、否则新建）
+  `shell/window.rs`（`SharedView` 全局、`APP_TITLE`、单例 `open_main_window` + `present_main_window` /
+  `minimize_main_window`：按根视图类型认窗口，启动/托盘唤出都显式抢一次前台）
 - **L3**：`core/config.rs`（配置与持久化）、`core/state.rs`（五态状态机，5 单测）、
   `core/event.rs`（妙播 SDK 事件 → `UiEvent`，4 单测）、
   `core/app.rs`（`Core`：唯一业务状态源，拥有配置/状态机/通道/日志/播放信息，5 单测）
@@ -91,7 +92,7 @@ channels (L4) ──EventSink(flume, 有界, 传 UiEvent)──▶ Core 事件�
 
 | 线程 | 归属 | 职责 |
 |---|---|---|
-| `myplay-tray` | `shell/tray.rs` | Windows 消息循环 + tooltip 刷新 |
+| `myplay-tray` | `shell/tray.rs` | Windows 消息循环 + tooltip 刷新 + 单实例唤醒标记轮询 |
 | `myplay-core` | `channels/remote_core.rs` | DLNA 核心的 tokio 运行时 |
 | `myplay-dlna-player` | `channels/dlna_player.rs` | 命令调度、cpal 输出流 |
 | `myplay-dlna-decode` | `channels/dlna_player.rs` | 拉流 + 解码，按「代次」响应 Stop / 换曲 / seek |
@@ -111,14 +112,17 @@ DLNA 停止的顺序是固定的：`Core::stop` → 播放器收到 `Stop`（立
 ```powershell
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p myplay   # 24 单测：state 5 / event 4 / app 5 / config 2 / dlna_player 2 / remote_core 3 / miplay 1 / audio 1 / system 1
+cargo test -p myplay   # 25 单测：state 5 / event 4 / app 5 / config 2 / dlna_player 2 / remote_core 3 / miplay 1 / audio 1 / system 1 / single_instance 1
 cargo run -p myplay
 ```
 
 手工回归清单：
 
 - 关窗后进程常驻、音乐继续；托盘重开窗口状态不丢（tab 与焦点会回到默认，属界面局部状态）
+- 开「启动后最小化到托盘」后重启：只有托盘图标、不出现窗口（首帧也不该闪）；点托盘左键才建窗并在前台
+- 重复启动 exe：第二个进程直接退出，已在跑的实例把窗口叫到前台（关着窗口也会重新打开），不会出现两个托盘图标
 - 两个通道各启动/停止/切换一次无回归
+- 启停状态还原：启动后退出 → 再开仍自动运行；停止后退出 → 再开仍为停止（参数不变）
 - 托盘「启动/停止/播放暂停」与窗口按钮行为一致；tooltip 随曲目与状态变化
 - 日志页滚动正常、条数上限 1000；改「日志文件」后新行落到新路径
 - 文本字段逐键输入不再卡顿，回车/失焦/关窗后改动落到 `settings.json`
