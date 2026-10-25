@@ -1,0 +1,33 @@
+[package]
+name = "airplay-receiver-core"
+version = "1.0.4"
+edition = "2024"
+autobins = false
+license = "AGPL-3.0-only"
+description = "DLNA DMR receiver core for FusionPlay (AirPlay channel removed)"
+
+[lib]
+name = "fusionplay_core"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+# 版本统一在根 `[workspace.dependencies]`；这里只保留成员自己的 feature 组合。
+# AirPlay（RAOP）通道已移除，因此不再依赖 shairplay / 音频引擎 / 配对存储。
+[dependencies]
+anyhow = { workspace = true }
+httparse = { workspace = true }
+if-addrs = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+socket2 = { workspace = true }
+# 只留 DLNA 实际用到的：`signal` / `io-std` 是上游 CLI（Ctrl+C、stdin）才需要的。
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tracing = { workspace = true }

@@ -1,0 +1,45 @@
+[package]
+name = "myplay"
+version = "0.1.0"
+edition = "2024"
+
+# 版本统一在根 `[workspace.dependencies]`；这里只保留成员自己的 feature 组合。
+[dependencies]
+gpui-kit = { workspace = true }
+
+# 配置持久化
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# 基础
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+# 事件通道：托盘线程 ↔ GPUI 主线程
+flume = { workspace = true }
+
+# 音频输出（与内联核心同一后端）
+cpal = { workspace = true }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+
+# DLNA 拉流与解码
+ureq = { workspace = true }
+# `wav` 只提供 RIFF 解封装，PCM/ADPCM 解码器要单独开 feature（WAV 无损播放的前提）。
+symphonia = { workspace = true, features = ["mp3", "flac", "wav", "pcm", "adpcm", "aac", "isomp4"] }
+
+# 接收器核心（工作区内置源码，path 声明在根清单）
+fusionplay-miplay-sdk = { workspace = true }
+airplay-receiver-core = { workspace = true }
+if-addrs = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = { workspace = true }
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-resource = { workspace = true }

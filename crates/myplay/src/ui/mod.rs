@@ -1,0 +1,1026 @@
+//! 主界面：左侧 Tab 导航 + 右侧内容区。
+//!
+//! 三个页面：设置（可配置项）、信息（广播/播放/连接统计）、日志（事件流）。
+//! 数据流：业务状态全部在 `core::app::Core`（唯一真相源）里，本视图只保留界面局部状态
+//! （当前 Tab、文本焦点、下拉开关、输出设备列表）；用户意图一律转发给 Core 的方法，
+//! Core 每次 `notify` 都触发本视图重绘。
+
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::*;
+
+use crate::channels::Snapshot;
+use crate::core::app::{Core, NowPlaying, TextEdit, TextField};
+use crate::core::config::{CloseAction, DeviceKind, Source};
+use crate::core::state::RunState;
+use crate::platform::audio::{self, OutputDevice};
+
+/// 日志页最多渲染多少行（`uniform_list` 只渲染可见部分，这里只限制可回看的历史长度）。
+const LOG_VIEW_LIMIT: usize = 500;
+/// 播放器封面边长。
+const COVER_SIZE: Pixels = px(132.);
+/// 进度条高度与圆角（2px 圆角≈胶囊形，跟随条高）。
+const PROGRESS_HEIGHT: Pixels = px(3.);
+const PROGRESS_RADIUS: Pixels = px(2.);
+
+/// 右侧页面。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    Settings,
+    Info,
+    Log,
+}
+
+impl Route {
+    const ALL: [Route; 3] = [Route::Settings, Route::Info, Route::Log];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Route::Settings => "设置",
+            Route::Info => "信息",
+            Route::Log => "日志",
+        }
+    }
+
+    const fn hint(self) -> &'static str {
+        match self {
+            Route::Settings => "设备名、类型、网络与行为",
+            Route::Info => "广播信息、当前播放、连接统计",
+            Route::Log => "接收器事件流",
+        }
+    }
+}
+
+/// L1 视图：只有界面局部状态，业务状态全在 [`Core`]。
+pub struct SettingsView {
+    /// 唯一业务状态源（窗口销毁后它仍然活着）。
+    core: Entity<Core>,
+    /// 当前右侧页面。
+    route: Route,
+    /// 正在编辑的文本字段。
+    focused: Option<TextField>,
+    /// 文本输入的焦点句柄。
+    focus: FocusHandle,
+    /// 日志列表的滚动位置（窗口重开回到顶部属预期）。
+    log_scroll: UniformListScrollHandle,
+    /// 输出设备下拉是否展开。
+    audio_open: bool,
+    /// 枚举到的输出设备（打开页面时枚举一次；切换设备不重新枚举）。
+    audio_devices: Vec<OutputDevice>,
+}
+
+impl SettingsView {
+    /// 绑定一个已存在的 [`Core`]，并订阅它的刷新。
+    pub fn new(core: Entity<Core>, cx: &mut Context<Self>) -> Self {
+        // Core 每次 notify → 视图重绘。视图销毁后回调自然失效（弱引用）。
+        cx.observe(&core, |_view, _core, cx| cx.notify()).detach();
+
+        Self {
+            core,
+            route: Route::Settings,
+            focused: None,
+            focus: cx.focus_handle(),
+            log_scroll: UniformListScrollHandle::new(),
+            audio_open: false,
+            audio_devices: audio::list_output_devices(),
+        }
+    }
+
+    /// 绑定窗口级行为：关闭窗口时把待落盘的文本提交，再按设置决定「回托盘」还是「退出」。
+    ///
+    /// 这里**不走平台的默认销毁**（回调返回 `false`）：那条路会先用 `DestroyWindow` 干掉 HWND，
+    /// GPUI 随后在窗口 `Drop` 里再销毁一次，Windows 就会刷「无效的窗口句柄」。
+    /// 改成 `remove_window` 后由 GPUI 自己移除窗口，句柄只销毁一次。
+    /// 业务状态在 [`Core`] 里，窗口重开不丢。
+    pub fn attach_window(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let weak = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            let close_action = weak
+                .update(cx, |view, cx| {
+                    // 关窗是文本编辑的终点：把内存里的改动落盘（窗口要没了，不再重绘）。
+                    view.focused = None;
+                    view.core.update(cx, |core, _| core.flush_settings());
+                    view.core.read(cx).settings.close_action
+                })
+                .unwrap_or(CloseAction::Quit);
+            window.remove_window();
+            if close_action == CloseAction::Quit {
+                // 退出推迟到下一轮前台任务：此刻还在 Windows 的关闭消息里，
+                // 直接退出会和窗口收尾打架。
+                cx.defer(|cx| cx.quit());
+            }
+            false
+        });
+    }
+}
+
+// ---------------------------------------------------------------- 渲染
+
+impl Render for SettingsView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .size_full()
+            .bg(rgb(0x16171b))
+            .text_color(rgb(0xdfe3ea))
+            .child(self.render_sidebar(cx))
+            .child(self.render_content(cx))
+    }
+}
+
+impl SettingsView {
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.route;
+        let mut column = v_flex()
+            .w(px(184.))
+            .h_full()
+            .flex_shrink_0()
+            .p_3()
+            .gap_1()
+            .bg(rgb(0x1a1c21))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .pb_3()
+                    .child(div().text_lg().text_color(rgb(0xf2f4f8)).child("myplay"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x8b919d))
+                            .child("小米妙播接收器"),
+                    ),
+            );
+
+        for route in Route::ALL {
+            let selected = current == route;
+            column = column.child(
+                div()
+                    .id(route.label())
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if selected {
+                        rgb(0x2a3550)
+                    } else {
+                        rgb(0x1a1c21)
+                    })
+                    .text_color(if selected {
+                        rgb(0xf2f4f8)
+                    } else {
+                        rgb(0xa8aebb)
+                    })
+                    .text_sm()
+                    .child(route.label())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.route = route;
+                        cx.notify();
+                    })),
+            );
+        }
+
+        column.child(div().flex_1()).child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x6f7683))
+                .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+        )
+    }
+
+    fn render_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // 只读 Core 时把需要的值一次取完，避免持有借用再去拿 `&mut Context`。
+        let (status, running) = {
+            let core = self.core.read(cx);
+            (core.status, core.is_running())
+        };
+        let status_color = match status {
+            RunState::Running => rgb(0x3ecf8e),
+            RunState::Failed => rgb(0xff6b81),
+            _ => rgb(0x8b919d),
+        };
+        let route = self.route;
+
+        let page: gpui_kit::AnyElement = match route {
+            Route::Settings => self.render_settings_page(cx).into_any_element(),
+            Route::Info => self.render_info_page(cx).into_any_element(),
+            Route::Log => self.render_log_page(cx).into_any_element(),
+        };
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .px_4()
+                    .py_3()
+                    .gap_3()
+                    .bg(rgb(0x1a1c21))
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .text_color(rgb(0xf2f4f8))
+                                    .child(route.label()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x8b919d))
+                                    .child(route.hint()),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(0x22252b))
+                                    .text_xs()
+                                    .text_color(status_color)
+                                    .child(status.label()),
+                            )
+                            .child(if running {
+                                action_button("停止", true, "btn-stop").on_click(cx.listener(
+                                    |view, _, _, cx| {
+                                        view.core.update(cx, |core, cx| core.stop(cx));
+                                    },
+                                ))
+                            } else {
+                                action_button("启动", false, "btn-start").on_click(cx.listener(
+                                    |view, _, _, cx| {
+                                        view.core.update(cx, |core, cx| core.start(cx));
+                                    },
+                                ))
+                            }),
+                    ),
+            )
+            .child(page)
+    }
+
+    fn render_settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (start_with_windows, start_minimized, verbose_log) = {
+            let core = self.core.read(cx);
+            (
+                core.settings.start_with_windows,
+                core.settings.start_minimized,
+                core.settings.verbose_log,
+            )
+        };
+
+        v_flex()
+            .id("page-settings")
+            .overflow_y_scroll()
+            .flex_1()
+            .p_4()
+            .gap_3()
+            .child(
+                panel("接收器")
+                    .child(self.render_source(cx))
+                    .child(self.render_field("设备名", TextField::Name, cx))
+                    .child(self.render_device_kind(cx)),
+            )
+            .child(self.render_audio(cx))
+            .child(
+                panel("行为")
+                    .child(self.render_close_action(cx))
+                    .child(toggle_row(
+                        "开机自启",
+                        "toggle-boot",
+                        start_with_windows,
+                        cx.listener(|view, _, _, cx| {
+                            view.core
+                                .update(cx, |core, cx| core.toggle_start_with_windows(cx));
+                        }),
+                    ))
+                    .child(toggle_row(
+                        "启动后最小化到托盘",
+                        "toggle-min",
+                        start_minimized,
+                        cx.listener(|view, _, _, cx| {
+                            view.core
+                                .update(cx, |core, cx| core.toggle_start_minimized(cx));
+                        }),
+                    ))
+                    .child(toggle_row(
+                        "详细日志",
+                        "toggle-verbose",
+                        verbose_log,
+                        cx.listener(|view, _, _, cx| {
+                            view.core.update(cx, |core, cx| core.toggle_verbose_log(cx));
+                        }),
+                    )),
+            )
+            .child(
+                panel("诊断")
+                    .child(self.render_field("日志文件（留空＝不写）", TextField::LogFile, cx))
+                    .child(self.render_field("退休实例（逗号分隔）", TextField::RetireLyra, cx))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x8b919d))
+                            .child("广播身份固定：单条目 · 真实 MAC"),
+                    ),
+            )
+    }
+
+    fn render_info_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let core = self.core.read(cx);
+
+        let uptime = core
+            .started_at
+            .map(|start| fmt_duration(start.elapsed().as_millis() as u64))
+            .unwrap_or_else(|| "—".to_owned());
+
+        let broadcast_rows: Vec<(&'static str, String)> = match &core.snapshot {
+            Some(snapshot) => snapshot_rows(snapshot),
+            None => match core.active_source() {
+                // 输出设备放在播放卡片里，这里不再重复一行。
+                Some(source) if source != Source::MiPlay => vec![
+                    ("通道", source.label().to_owned()),
+                    ("设备名", core.settings.name.clone()),
+                ],
+                _ => vec![("状态", "未启动".to_owned())],
+            },
+        };
+
+        let stats_rows = if core.active_source() == Some(Source::Dlna) {
+            vec![
+                (
+                    "媒体主机",
+                    if core.playing.media_host.is_empty() {
+                        "—".to_owned()
+                    } else {
+                        core.playing.media_host.clone()
+                    },
+                ),
+                ("运行时长", uptime),
+                ("本次曲目数", core.tracks.to_string()),
+                ("媒体流重建", core.reconnects.to_string()),
+            ]
+        } else {
+            vec![
+                (
+                    "对端",
+                    if core.peer.is_empty() {
+                        "—".to_owned()
+                    } else {
+                        core.peer.clone()
+                    },
+                ),
+                (
+                    "握手阶段",
+                    if core.stage.is_empty() {
+                        "—".to_owned()
+                    } else {
+                        core.stage.clone()
+                    },
+                ),
+                ("运行时长", uptime),
+                ("本次曲目数", core.tracks.to_string()),
+                ("媒体流重建", core.reconnects.to_string()),
+            ]
+        };
+
+        let detail = if core.detail.is_empty() {
+            "点击右上角「启动」开始接收".to_owned()
+        } else {
+            core.detail.clone()
+        };
+        let player = self.render_now_playing(cx);
+
+        v_flex()
+            .id("page-info")
+            .overflow_y_scroll()
+            .flex_1()
+            .p_4()
+            .gap_3()
+            .child(div().text_sm().text_color(rgb(0xa8aebb)).child(detail))
+            .child(card("广播信息", broadcast_rows))
+            .child(player)
+            .child(card("连接与统计", stats_rows))
+    }
+
+    /// 「当前播放」：左侧封面 + 右侧曲名/元信息/进度条，按播放器排版。
+    ///
+    /// 空态与缺封面都用同尺寸占位，换曲或缺图时布局不跳动。
+    fn render_now_playing(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let core = self.core.read(cx);
+        let playing = &core.playing;
+        let has_media = !playing.title.is_empty();
+
+        let cover: AnyElement = match &playing.artwork {
+            Some(image) => img(image.clone())
+                .w(COVER_SIZE)
+                .h(COVER_SIZE)
+                .flex_shrink_0()
+                .rounded_lg()
+                .into_any_element(),
+            None => div()
+                .w(COVER_SIZE)
+                .h(COVER_SIZE)
+                .flex_shrink_0()
+                .rounded_lg()
+                .bg(rgb(0x24262c))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(rgb(0x6f7683))
+                .child(if has_media { "无封面" } else { "未播放" })
+                .into_any_element(),
+        };
+
+        let title = if has_media {
+            playing.title.clone()
+        } else {
+            "未在播放".to_owned()
+        };
+        // 副标题只拼有内容的字段，避免出现「 ·  · 」这类空分隔。
+        let subtitle = [playing.artist.as_str(), playing.album.as_str()]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let subtitle = if has_media && subtitle.is_empty() {
+            "未知艺术家".to_owned()
+        } else if has_media {
+            subtitle
+        } else {
+            "从手机投送后，这里会显示曲目、封面与进度".to_owned()
+        };
+
+        let meta = format_meta(playing);
+        let output = core.active_output.clone().unwrap_or_else(|| "—".to_owned());
+        let volume = playing
+            .volume
+            .map(|percent| format!("音量 {percent}%"))
+            .unwrap_or_else(|| "音量 —".to_owned());
+
+        let mut column = v_flex()
+            .flex_1()
+            .min_w(px(0.))
+            .gap_1()
+            .child(
+                div()
+                    .text_lg()
+                    .text_color(rgb(0xf2f4f8))
+                    .truncate()
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xa8aebb))
+                    .truncate()
+                    .child(subtitle),
+            );
+
+        // 进度条只在有媒体时出现：没有播放内容时它既没有信息量，也避免显示 00:00。
+        if has_media {
+            let fraction = if playing.duration_ms == 0 {
+                0.0
+            } else {
+                (playing.position_ms as f32 / playing.duration_ms as f32).clamp(0.0, 1.0)
+            };
+            let progress_fill = (fraction > 0.0).then(|| {
+                div()
+                    .h_full()
+                    .w(relative(fraction))
+                    .rounded(PROGRESS_RADIUS)
+                    .bg(rgb(0x2f6fed))
+            });
+            let total = if playing.duration_ms == 0 {
+                "--:--".to_owned()
+            } else {
+                fmt_duration(playing.duration_ms)
+            };
+            let bar = h_flex()
+                .w_full()
+                .h(PROGRESS_HEIGHT)
+                .rounded(PROGRESS_RADIUS)
+                .bg(rgb(0x33363d))
+                .children(progress_fill);
+            column = column.child(div().w_full().pt_2().child(bar)).child(
+                h_flex()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(rgb(0x8b919d))
+                    .child(fmt_duration(playing.position_ms))
+                    .child(total),
+            );
+        }
+
+        if !meta.is_empty() {
+            column = column.child(div().text_xs().text_color(rgb(0x8b919d)).child(meta));
+        }
+
+        if has_media {
+            column = column.child(
+                h_flex()
+                    .w_full()
+                    .gap_4()
+                    .text_xs()
+                    .text_color(rgb(0x8b919d))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .child(format!("输出：{output}")),
+                    )
+                    .child(div().flex_shrink_0().child(volume)),
+            );
+        }
+
+        panel("当前播放").child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_4()
+                .child(cover)
+                .child(column),
+        )
+    }
+
+    /// 日志页：最新 500 行，交给 `uniform_list` 只渲染可见部分。
+    fn render_log_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let total = self.core.read(cx).log.len();
+        let shown = total.min(LOG_VIEW_LIMIT);
+        let core = self.core.clone();
+
+        let body: AnyElement = if shown == 0 {
+            div()
+                .text_xs()
+                .text_color(rgb(0x6f7683))
+                .child("暂无事件")
+                .into_any_element()
+        } else {
+            uniform_list("log-lines", shown, move |range, _window, cx| {
+                let log = &core.read(cx).log;
+                range
+                    .map(|index| {
+                        // 最新在前：index 0 是最后一行（最新），超出上限的旧行不再显示。
+                        let line = log
+                            .get(total.saturating_sub(1 + index))
+                            .cloned()
+                            .unwrap_or_default();
+                        div()
+                            .w_full()
+                            .h(px(18.))
+                            .px_4()
+                            .text_xs()
+                            .truncate()
+                            .text_color(rgb(0xa8aebb))
+                            .child(line)
+                    })
+                    .collect()
+            })
+            .flex_1()
+            .track_scroll(&self.log_scroll)
+            .into_any_element()
+        };
+
+        v_flex()
+            .id("page-log")
+            .flex_1()
+            .p_4()
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x8b919d))
+                            .child(format!("共 {total} 条（最新在前）")),
+                    )
+                    .child(
+                        action_button("清空", false, "btn-clear-log").on_click(cx.listener(
+                            |view, _, _, cx| {
+                                view.core.update(cx, |core, cx| core.clear_log(cx));
+                            },
+                        )),
+                    ),
+            )
+            .child(body)
+    }
+
+    fn render_field(
+        &self,
+        label: &str,
+        field: TextField,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let focused = self.focused == Some(field);
+        let value = {
+            let core = self.core.read(cx);
+            field.text(&core.settings).to_owned()
+        };
+        let shown = if value.is_empty() && !focused {
+            "—".to_owned()
+        } else {
+            value
+        };
+
+        v_flex().gap_1().child(field_caption(label)).child(
+            div()
+                .id(field.element_id())
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(if focused {
+                    rgb(0x2f6fed)
+                } else {
+                    rgb(0x33363d)
+                })
+                .bg(if focused {
+                    rgb(0x263049)
+                } else {
+                    rgb(0x24262c)
+                })
+                .cursor_pointer()
+                .track_focus(&self.focus)
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    // 换字段即提交上一个字段（落盘一次），逐键输入不写盘。
+                    if view.focused.is_some_and(|current| current != field) {
+                        view.core.update(cx, |core, cx| core.commit_text(cx));
+                    }
+                    let handle = view.focus.clone();
+                    view.focused = Some(field);
+                    window.focus(&handle, cx);
+                    cx.notify();
+                }))
+                .on_key_down(cx.listener(move |view, event: &KeyDownEvent, _window, cx| {
+                    let key = event.keystroke.key.as_str();
+                    // 焦点进出属于界面局部状态，留在视图里处理；顺带提交改动。
+                    if key == "escape" || key == "enter" {
+                        view.focused = None;
+                        view.core.update(cx, |core, cx| core.commit_text(cx));
+                        return;
+                    }
+                    let edit = match key {
+                        "backspace" => TextEdit::Backspace,
+                        _ => event
+                            .keystroke
+                            .key_char
+                            .as_deref()
+                            .map_or(TextEdit::Ignore, TextEdit::Insert),
+                    };
+                    view.core
+                        .update(cx, |core, cx| core.type_key(field, edit, cx));
+                }))
+                .child(div().text_sm().text_color(rgb(0xe6e9ef)).child(shown)),
+        )
+    }
+
+    /// 音频输出设备下拉：显示当前选择与实际正在使用的设备。
+    fn render_audio(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (current_label, active_output) = {
+            let core = self.core.read(cx);
+            let current_label = if core.settings.output_device.is_empty() {
+                "系统默认".to_owned()
+            } else {
+                self.audio_devices
+                    .iter()
+                    .find(|device| device.id == core.settings.output_device)
+                    .map(|device| device.name.clone())
+                    .unwrap_or_else(|| core.settings.output_device.clone())
+            };
+            (current_label, core.active_output.clone())
+        };
+
+        let mut panel = panel("音频").child(field_caption("输出设备")).child(
+            h_flex()
+                .id("audio-selector")
+                .justify_between()
+                .items_center()
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(if self.audio_open {
+                    rgb(0x2f6fed)
+                } else {
+                    rgb(0x33363d)
+                })
+                .bg(rgb(0x24262c))
+                .cursor_pointer()
+                .text_sm()
+                .text_color(rgb(0xe6e9ef))
+                .child(current_label)
+                .child(div().text_xs().text_color(rgb(0x8b919d)).child("▾"))
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.audio_open = !view.audio_open;
+                    cx.notify();
+                })),
+        );
+
+        if self.audio_open {
+            let mut list = v_flex().gap_1();
+            // 「系统默认」永远在列表首位。
+            list = list.child(self.audio_option(None, "系统默认".to_owned(), cx));
+            for device in &self.audio_devices {
+                list =
+                    list.child(self.audio_option(Some(device.id.clone()), device.name.clone(), cx));
+            }
+            if self.audio_devices.is_empty() {
+                list = list.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x6f7683))
+                        .child("未枚举到输出设备，只能使用系统默认"),
+                );
+            }
+            panel = panel.child(list);
+        }
+
+        panel.child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x8b919d))
+                .child(match active_output {
+                    Some(name) => format!("正在使用：{name}"),
+                    None => "未开始播放".to_owned(),
+                }),
+        )
+    }
+
+    fn audio_option(
+        &self,
+        id: Option<String>,
+        label: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = {
+            let core = self.core.read(cx);
+            core.settings.output_device.as_str() == id.as_deref().unwrap_or_default()
+        };
+        // 元素 id 由领域值（设备 id）派生，不用列表下标。
+        let element_id = match &id {
+            Some(device_id) => ElementId::Name(SharedString::from(format!("audio-{device_id}"))),
+            None => ElementId::from("audio-system-default"),
+        };
+        div()
+            .id(element_id)
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(if selected {
+                rgb(0x263049)
+            } else {
+                rgb(0x1f2127)
+            })
+            .text_sm()
+            .text_color(if selected {
+                rgb(0xf2f4f8)
+            } else {
+                rgb(0xdfe3ea)
+            })
+            .cursor_pointer()
+            .child(label)
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.audio_open = false;
+                let id = id.clone().unwrap_or_default();
+                view.core
+                    .update(cx, |core, cx| core.set_output_device(id, cx));
+            }))
+    }
+
+    /// 启动源选择：小米妙播 / DLNA。
+    fn render_source(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let source = self.core.read(cx).settings.source;
+        let row = chip_row(&Source::ALL, Source::label, |candidate, text| {
+            chip(text, source == candidate).on_click(cx.listener(move |view, _, _, cx| {
+                view.core
+                    .update(cx, |core, cx| core.set_source(candidate, cx));
+            }))
+        });
+        v_flex()
+            .gap_1()
+            .child(field_caption("启动源"))
+            .child(row)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8b919d))
+                    .child(source.hint()),
+            )
+    }
+
+    fn render_device_kind(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.core.read(cx).settings.device_type;
+        let row = chip_row(&DeviceKind::ALL, DeviceKind::label, |kind, text| {
+            chip(text, current == kind).on_click(cx.listener(move |view, _, _, cx| {
+                view.core
+                    .update(cx, |core, cx| core.set_device_kind(kind, cx));
+            }))
+        });
+        v_flex().gap_1().child(field_caption("设备类型")).child(row)
+    }
+
+    fn render_close_action(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.core.read(cx).settings.close_action;
+        let row = chip_row(&CloseAction::ALL, CloseAction::label, |action, text| {
+            chip(text, current == action).on_click(cx.listener(move |view, _, _, cx| {
+                view.core
+                    .update(cx, |core, cx| core.set_close_action(action, cx));
+            }))
+        });
+        v_flex()
+            .gap_1()
+            .child(field_caption("关闭窗口时"))
+            .child(row)
+    }
+}
+
+// ---------------------------------------------------------------- 小组件
+
+/// 妙播广播信息 → 信息页的行。
+fn snapshot_rows(snapshot: &Snapshot) -> Vec<(&'static str, String)> {
+    vec![
+        ("通道", "小米妙播".to_owned()),
+        ("设备名", snapshot.name.clone()),
+        ("设备类型", snapshot.device_type.to_owned()),
+        ("地址", snapshot.local_ip.clone()),
+        ("接口", snapshot.interface.clone()),
+        ("广播 MAC", snapshot.hardware_address.clone()),
+        ("mDNS", snapshot.mdns_service.clone()),
+        ("Lyra 端口", snapshot.lyra_port.to_string()),
+        ("公布模式", "单条目".to_owned()),
+    ]
+}
+
+/// 播放参数单行文本：`MP3 · 44100 Hz · 320 kbps`（空字段自动跳过）。
+fn format_meta(playing: &NowPlaying) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    if !playing.codec.is_empty() {
+        parts.push(playing.codec.clone());
+    }
+    if playing.sample_rate > 0 {
+        parts.push(format!("{} Hz", playing.sample_rate));
+    }
+    if playing.bitrate > 0 {
+        parts.push(format!("{} kbps", playing.bitrate / 1000));
+    }
+    parts.join(" · ")
+}
+
+fn fmt_duration(ms: u64) -> String {
+    let total = ms / 1000;
+    format!("{:02}:{:02}", total / 60, total % 60)
+}
+
+fn panel(title: &'static str) -> gpui_kit::Div {
+    v_flex()
+        .gap_2()
+        .p_3()
+        .rounded_lg()
+        .bg(rgb(0x1f2127))
+        .child(section_title(title))
+}
+
+fn section_title(text: &str) -> impl IntoElement {
+    div()
+        .text_sm()
+        .text_color(rgb(0xf2f4f8))
+        .child(text.to_owned())
+}
+
+fn field_caption(text: &str) -> impl IntoElement {
+    div()
+        .text_xs()
+        .text_color(rgb(0x8b919d))
+        .child(text.to_owned())
+}
+
+fn card(title: &'static str, rows: Vec<(&'static str, String)>) -> gpui_kit::Div {
+    let mut column = panel(title);
+    for (key, value) in rows {
+        column = column.child(
+            h_flex()
+                .justify_between()
+                .gap_4()
+                .child(
+                    div()
+                        .w(px(96.))
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(rgb(0x8b919d))
+                        .child(key),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .text_color(rgb(0xe6e9ef))
+                        .child(value),
+                ),
+        );
+    }
+    column
+}
+
+/// 一组单选 chip：`label` 提供文案，`build` 负责选中态与点击行为（各调用点自己知道语义）。
+fn chip_row<T: Copy>(
+    values: &[T],
+    label: fn(T) -> &'static str,
+    mut build: impl FnMut(T, &'static str) -> gpui_kit::Stateful<gpui_kit::Div>,
+) -> impl IntoElement {
+    let mut row = h_flex().flex_wrap().gap_1();
+    for value in values.iter().copied() {
+        let text = label(value);
+        row = row.child(build(value, text));
+    }
+    row
+}
+
+fn chip(label: &'static str, selected: bool) -> gpui_kit::Stateful<gpui_kit::Div> {
+    div()
+        .id(label)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(if selected {
+            rgb(0x2f6fed)
+        } else {
+            rgb(0x33363d)
+        })
+        .bg(if selected {
+            rgb(0x2f6fed)
+        } else {
+            rgb(0x24262c)
+        })
+        .text_sm()
+        .text_color(if selected {
+            rgb(0xffffff)
+        } else {
+            rgb(0xdfe3ea)
+        })
+        .cursor_pointer()
+        .child(label)
+}
+
+fn action_button(
+    label: &'static str,
+    destructive: bool,
+    id: &'static str,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    div()
+        .id(id)
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .bg(if destructive {
+            rgb(0xd03050)
+        } else {
+            rgb(0x2f6fed)
+        })
+        .text_color(rgb(0xffffff))
+        .text_sm()
+        .cursor_pointer()
+        .child(label)
+}
+
+fn toggle_row(
+    label: &'static str,
+    id: &'static str,
+    on: bool,
+    handler: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    // 整行可点：方框在文字前面，勾选态由方框填充 + 对勾表达。
+    h_flex()
+        .id(id)
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .on_click(handler)
+        .child(
+            div()
+                .w(px(14.))
+                .h(px(14.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .border_1()
+                .border_color(if on { rgb(0x2f6fed) } else { rgb(0x4a4f5a) })
+                .bg(if on { rgb(0x2f6fed) } else { rgb(0x1f2127) })
+                .text_color(rgb(0xffffff))
+                .text_xs()
+                .child(if on { "✓" } else { " " }),
+        )
+        .child(div().text_sm().text_color(rgb(0xdfe3ea)).child(label))
+}

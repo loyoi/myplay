@@ -1,0 +1,48 @@
+[package]
+name = "fusionplay-miplay-sdk"
+version = "1.0.4"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Self-contained, cross-platform Xiaomi MiPlay audio receiver SDK"
+
+[lib]
+name = "fusionplay_miplay_sdk"
+crate-type = ["rlib"]
+
+# 上游的 RTSP / RTP 装配函数天然宽参数（流、密钥、时钟、统计各一路）；
+# 拆分只带来封装成本，本仓库不参与该风格门禁。
+[lints.clippy]
+too_many_arguments = "allow"
+
+# 版本统一在根 `[workspace.dependencies]`；这里只保留成员自己的 feature 组合。
+[dependencies]
+aes = { workspace = true }
+aes-gcm = { workspace = true }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+cbc = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+hkdf = { workspace = true }
+if-addrs = { workspace = true }
+md-5 = { workspace = true }
+rand = { workspace = true }
+p256 = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+socket2 = { workspace = true }
+symphonia = { workspace = true, features = ["aac"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+oboe = { workspace = true }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+cpal = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# 只用到 GetUnicastIpAddressTable / FreeMibTable 与 AF_INET6；Ndis / Registry 无引用。
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+] }

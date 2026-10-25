@@ -1,0 +1,89 @@
+# 工作区根清单：成员编排、profile 决策与**唯一版本声明点**，不放代码。
+# 应用在 `crates/myplay`；三份接收器源码已内联到 `crates/`，由本仓库自行维护，
+# shairplay 直接用上游 git 仓库。上游来源见 README「内置源码与上游来源」与各 crate 的 `UPSTREAM.md`。
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# `cargo run` / `cargo build` 默认只作用于桌面应用；全仓库校验请显式加 `--workspace`。
+default-members = ["crates/myplay"]
+
+# 所有依赖的版本（及默认特性开关）只写在这里，成员清单只写 `workspace = true` + 成员自己的
+# feature 列表。内部成员的 path 也只在这里出现一次；无人使用的条目随功能下线及时删除
+# （AirPlay 移除后，shairplay 及其专属加密/配对依赖已从这里清掉）。
+[workspace.dependencies]
+# ---- 工作区内置源码 ----
+fusionplay-miplay-sdk = { path = "crates/fusionplay-miplay-sdk" }
+airplay-receiver-core = { path = "crates/airplay-receiver-core" }
+if-addrs = { path = "crates/fusionplay-if-addrs" }
+
+# ---- 桌面应用 ----
+gpui-kit = "^0.8"
+# 只用 `Env::default().default_filter_or(..)`：不需要 `/正则` 过滤，也不需要 humantime 时间戳，
+# 因此不带默认 feature（默认会拉进 regex / regex-automata / jiff）。
+env_logger = { version = "^0.11", default-features = false, features = ["auto-color"] }
+flume = "^0.12"
+ureq = "^3.5"
+tray-icon = "^0.26"
+windows = "^0.62"
+embed-resource = "^3"
+
+# ---- 通用 ----
+anyhow = "^1"
+log = "^0.4"
+serde = { version = "^1", features = ["derive"] }
+serde_json = "^1"
+tokio = "^1"
+tracing = "^0.1"
+
+# ---- 加密与编码 ----
+aes = "^0.9"
+aes-gcm = "^0.11"
+base64 = "^0.23"
+cbc = { version = "^0.2", features = ["alloc"] }
+hex = "^0.4"
+hkdf = "^0.13"
+hmac = "^0.13"
+md-5 = "^0.11"
+# 只用 ECDH + SEC1 解析：默认 feature 里的 ecdsa / pem / precomputed-tables 都不需要。
+p256 = { version = "^0.14", default-features = false, features = ["ecdh", "std"] }
+rand = "^0.10"
+sha2 = "^0.11"
+
+# ---- 音频与网络 ----
+# 音频栈全仓库统一一套：cpal 0.18 / symphonia 0.6.1（应用与内联源码共用）。
+# `wav` 只提供 RIFF 解封装，PCM/ADPCM 解码器要由使用方单独开 feature。
+cpal = "^0.18.2"
+# `opt-simd` 打开 MDCT/FFT 的 SIMD 路径（symphonia-core 用 rustfft），解码更快。
+symphonia = { version = "^0.6.1", default-features = false, features = ["opt-simd"] }
+httparse = "^1.10"
+socket2 = "^0.6"
+getifs = "^0.7"
+
+# ---- 平台相关（仅 Windows / Android 目标启用）----
+windows-sys = "^0.61"
+oboe = "^0.6.1"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# `package."*"` 只覆盖外部依赖，不覆盖工作区成员：三份内置源码显式对齐到 opt-level 2，
+# 保持与它们还是外部 path 依赖时一致（解码与网络在调试期不掉帧）。
+[profile.dev.package.fusionplay-miplay-sdk]
+opt-level = 2
+
+[profile.dev.package.airplay-receiver-core]
+opt-level = 2
+
+[profile.dev.package.if-addrs]
+opt-level = 2
+
+
+[profile.release]
+codegen-units = 1 # Allows LLVM to perform better optimization.
+lto = true # Enables link-time-optimizations.
+opt-level = "s" # Prioritizes small binary size. Use `3` if you prefer speed.
+panic = "abort" # Higher performance by disabling panic handlers.
+strip = true # Ensures debug symbols are removed.
