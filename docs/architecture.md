@@ -56,7 +56,8 @@ crates/fusionplay-if-addrs/     # if-addrs 适配层，crate 名仍为 if-addrs�
   `core/app.rs`（`Core`：唯一业务状态源，拥有配置/状态机/通道/日志/播放信息，5 单测）
 - **L4**：`channels/mod.rs` 的 `Channel` trait 由 `miplay::Receiver` 与 `remote_core::CoreReceiver`
   直接实现（不再有转发包装类型）；`dlna_player.rs` 为 DLNA 本地播放（流式拉流、Range seek、
-  cpal 输出、进度回填 DMR）；`remote_core::translate` 是核心事件词表的唯一翻译点
+  服务端忽略 Range 时整包缓存 / 本地跳字节补偿、重采样到设备采样率、cpal 输出、进度回填 DMR；每首曲目开头打一行质量诊断日志：控制点声明的质量 vs 实测编码/字节/时长/码率）；
+  `remote_core::translate` 是核心事件词表的唯一翻译点
 
 ## Core 归属（状态在 Core，界面只有局部状态）
 
@@ -107,12 +108,58 @@ DLNA 停止的顺序是固定的：`Core::stop` → 播放器收到 `Stop`（立
 （SSDP 发 `byebye`、HTTP 监听关闭）→ 再留 80 ms 让 GENA 通知离场，最后丢弃运行时。
 这样控制点在设备消失前就能收到「已停止」，不会因为运行时先死而收不到通知。
 
+### 已知限制：控制点切走时不会通知渲染器
+
+UPnP-AV 没有「控制点已离开」的通知或心跳，渲染器只对 `SetAVTransportURI / Play /
+Pause / Stop / Seek` 负责。实测（手机投送代理）：控制点把播放目标切回本机时**不发任何请求**，
+于是本机继续播到媒体结束。这无法在接收端可靠推断——手机息屏或 App 进后台时
+`GetPositionInfo` 轮询也可能停止，用「轮询静默」做自动停止会误杀正常播放。
+因此停止只能由控制点下达指令，或用户从托盘 / 窗口点「停止」。
+
+`dlna_player.rs` 里为排查这类问题保留了控制点请求日志（`DLNA 控制点请求：…`，
+只记会改变状态的动作用、不记轮询查询）以及每首曲目一行的质量诊断日志。
+
+### 质量显示的数据来源
+
+「信息」页那行 `编码 · 采样率 · 码率` 在两个通道里来源不同，排查「显示不对」时先看这里：
+
+| 字段 | 妙播 | DLNA |
+|---|---|---|
+| 编码 | 协议常量 `AAC`（妙播固定 AAC-LC） | symphonia 探测出的真实编码名；只有查不到时才退回 mime |
+| 采样率 | 协议常量 48000（SDK 对每个 ADTS 头强校验必须 48 kHz） | symphonia 实际 probe 出的解码参数 |
+| 码率 | 首帧标称值（`adts_bitrate`）→ 之后每 2 秒被**实测滑窗吞吐**刷新 | 总字节 × 8 ÷ 解码时长（文件级平均） |
+
+妙播的实测码率与回送给手机的 `latency_feedback` 是同一个数（`MiPlayLatencyTelemetry` 的 2 秒
+滑窗 RTP 吞吐）；DLNA 的每个字段都能在 `DLNA 质量诊断` 那行日志里对照核对。
+
+### 妙播的歌词/画面对齐
+
+手机端的歌词高亮按「发送方时间线 + 它认为的接收端时延」走，因此对齐取决于两件事：
+
+1. **我们是否贴着发送方时间线在播**——SDK 用发送方的 timer-server 时钟做调度
+   （`presentation_schedule_error_micros`），正误差补静音、负误差超阈值丢帧、再用 ≤0.25% 的
+   速率微调，稳态应稳定在 ±2 ms（`MIPLAY_SYNC_DEADBAND_MILLIS`）。
+2. **我们上报的时延是否等于实际时延**——每 250 ms 发一次 `VIDEO_LATENCY`，
+   报的是**输出设备延迟**（而不是「队列 + 输出」）：播放已钉在 PTS 上，队列深度只是发送方的
+   提前量，不让声音变晚。曾把「队列 + 输出」约 830 ms 当延迟上报，手机据此推进歌词，
+   结果歌词比声音慢近一秒；队列目标本身仍由 `MIPLAY_GROUP_PLAY_DELAY_MILLIS`(800) 与
+   `MIPLAY_MINIMUM_QUEUE_DELAY_MILLIS`(650) 决定，属于多房间齐奏的缓冲设计，
+   局域网下不需要，但改动它会影响 sender 的提前量，非必要不动。
+3. **手机端的歌词进度不由接收端出声时刻驱动**——实测把整体出声时刻在 ±200 ms 之间来回平移，
+   歌词与声音的相对偏差没有可辨变化：手机是按自己的播放位置与滚动动画推进歌词的。
+   因此代码里不保留任何「播放延迟补偿」旋钮，出声时刻严格贴发送方时间线；
+   剩余差异属于手机端，接收端没有可用的调节手段。
+
+判读方法：调度误差长期偏离 0 说明时序没贴住（可以临时在 `AacPlayer` 回调旁观察
+`presentation_schedule_error_micros`）；上报时延偏离实际输出延迟说明回报口径错了。
+两者都正常而歌词仍偏，则偏差在手机端的固定补偿或歌词滚动动画上，接收端无法干预。
+
 ## 本地验证（需人工执行）
 
 ```powershell
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p myplay   # 25 单测：state 5 / event 4 / app 5 / config 2 / dlna_player 2 / remote_core 3 / miplay 1 / audio 1 / system 1 / single_instance 1
+cargo test -p myplay   # 39 单测：state 5 / event 4 / app 5 / config 2 / dlna_player 16 / remote_core 3 / miplay 1 / audio 1 / system 1 / single_instance 1
 cargo run -p myplay
 ```
 
