@@ -29,6 +29,14 @@
 - `[lints.clippy] too_many_arguments = "allow"`：RTSP/RTP 装配函数天然宽参数（流、密钥、
   时钟、统计各一路），拆分只增加封装成本。
 - `media.rs` 的 `chunks_exact(N)` 改为 `as_chunks::<N>()`，`clippy -D warnings` 门禁要求。
+- `VIDEO_LATENCY` 回报口径修正（`video_latency_request`）：`latency:` 只报**输出设备延迟**，
+  不再报「播放队列 + 输出」。SDK 的播放钉在发送方 PTS 时间线上，队列深度只是发送方的
+  提前量，不让声音变晚；把队列算进回报会让手机把歌词整体推后约 0.8 秒。快照因此新增
+  `output_latency_millis`（队列与合计仍保留在 `latency_millis` 里）。
+- 音频质量上报做实（`media.rs`）：首帧发标称码率（`measured: false`，取自 `adts_bitrate`），
+  之后每 2 秒发一条**实测码率**（`measured: true`），数据源是 `MiPlayLatencyTelemetry` 的
+  2 秒滑窗 RTP 吞吐（即回送给手机的同一个 `bitrate_bps`）。两类上报共用
+  `audio_format_event()` 构造函数，界面沿用同一条 `audio_format` 事件，无需额外解析。
 
 ## 未内联的上游文件
 

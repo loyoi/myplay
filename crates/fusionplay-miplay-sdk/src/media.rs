@@ -247,7 +247,10 @@ struct RtpTelemetryState {
 
 #[derive(Clone, Copy, Debug)]
 struct MiPlayLatencySnapshot {
+    /// 队列 + 输出设备的总缓冲深度（官方音箱回报的也是这个口径）。
     latency_millis: u32,
+    /// 输出设备延迟（毫秒）：样本进入声卡到扬声器出声的时间。
+    output_latency_millis: u32,
     bitrate_bps: u64,
     rtp_packet_number: u64,
     arrival_residual_millis: f64,
@@ -357,6 +360,13 @@ impl MiPlayLatencyTelemetry {
         Some(MiPlayLatencySnapshot {
             latency_millis: u32::try_from(latency_micros.saturating_add(500) / 1_000)
                 .unwrap_or(u32::MAX),
+            output_latency_millis: u32::try_from(
+                self.output_latency_micros
+                    .load(Ordering::Acquire)
+                    .saturating_add(500)
+                    / 1_000,
+            )
+            .unwrap_or(u32::MAX),
             bitrate_bps: state.bitrate_bps,
             rtp_packet_number,
             arrival_residual_millis: state.arrival_residual_millis,
@@ -1309,6 +1319,8 @@ fn run_media_reader(
     let encrypted_media_expected = keys.is_some();
     let mut demuxer = TsDemuxer::new(keys);
     let mut first_packet = true;
+    // 首帧只能给标称码率；之后按固定间隔用实测吞吐刷新（与 RTSP 侧的延迟回报同一种内联写法）。
+    let mut next_bitrate_report = Instant::now() + MIPLAY_BITRATE_REPORT_INTERVAL;
     // Reuse the largest allocation seen on this connection. MiPlay sends one
     // RTP packet every few milliseconds, so allocating a fresh Vec for every
     // packet creates avoidable allocator traffic on the audio reader thread.
@@ -1347,24 +1359,30 @@ fn run_media_reader(
             rtp.len(),
             arrival,
         );
+        if arrival >= next_bitrate_report {
+            next_bitrate_report = arrival + MIPLAY_BITRATE_REPORT_INTERVAL;
+            if let Some(snapshot) = latency_telemetry.snapshot()
+                && snapshot.bitrate_bps > 0
+            {
+                events(audio_format_event(
+                    snapshot.bitrate_bps,
+                    MIPLAY_SAMPLE_RATE_HZ,
+                    true,
+                    encrypted_media_expected,
+                ));
+            }
+        }
         for packet in rtp_packet.payload.as_chunks::<188>().0 {
             for audio_pes in demuxer.push_ts_at(packet, Some(rtp_packet.timestamp_micros))? {
                 let aac = &audio_pes.payload;
                 if first_packet {
                     first_packet = false;
-                    let source_sample_rate = adts_sample_rate(aac).unwrap_or(0);
-                    let bitrate = adts_bitrate(aac).unwrap_or(0);
-                    events(json!({
-                        "event": "audio_format",
-                        "codec": "AAC-LC",
-                        "sample_rate": source_sample_rate,
-                        "required_sample_rate": MIPLAY_SAMPLE_RATE_HZ,
-                        "channels": 2,
-                        "bits_per_sample": 16,
-                        "bitrate": bitrate,
-                        "encrypted": encrypted_media_expected,
-                        "transport": "RTP/MP2T/TCP",
-                    }));
+                    events(audio_format_event(
+                        adts_bitrate(aac).unwrap_or(0),
+                        adts_sample_rate(aac).unwrap_or(0),
+                        false,
+                        encrypted_media_expected,
+                    ));
                 }
                 player.decode_adts(aac, audio_pes.pts_micros)?;
             }
@@ -1973,6 +1991,8 @@ const MIPLAY_LATENCY_REPORT_INTERVAL: StdDuration = StdDuration::from_millis(250
 const MIPLAY_RTSP_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
 const MIPLAY_BITRATE_WINDOW: StdDuration = StdDuration::from_secs(2);
 const MIPLAY_MINIMUM_BITRATE_WINDOW: StdDuration = StdDuration::from_millis(250);
+/// 实测码率上报间隔（界面显示用；比 250 ms 的延迟回报稀疏得多）。
+const MIPLAY_BITRATE_REPORT_INTERVAL: StdDuration = StdDuration::from_secs(2);
 const MIPLAY_RTP_REGRESSION_SAMPLES: usize = 128;
 const MIPLAY_OUTPUT_LATENCY_REFRESH_CALLBACKS: u32 = 64;
 const MIPLAY_OUTPUT_LATENCY_SMOOTHING: f64 = 0.2;
@@ -3000,6 +3020,35 @@ fn send_rtsp_response(stream: &mut TcpStream, cseq: &str, body: &str) -> Result<
         .context("write RTSP response")
 }
 
+/// 构造统一的 `audio_format` 事件。
+///
+/// 首帧只能给标称码率（`measured = false`，取自 `adts_bitrate`），之后按间隔给实测吞吐
+/// （`measured = true`，取自 RTP 滑窗），界面只认这条事件，不区分来源。
+fn audio_format_event(
+    bitrate_bps: u64,
+    sample_rate: u32,
+    measured: bool,
+    encrypted: bool,
+) -> serde_json::Value {
+    json!({
+        "event": "audio_format",
+        "codec": "AAC-LC",
+        "sample_rate": sample_rate,
+        "required_sample_rate": MIPLAY_SAMPLE_RATE_HZ,
+        "channels": 2,
+        "bits_per_sample": 16,
+        "bitrate": bitrate_bps,
+        "measured": measured,
+        "encrypted": encrypted,
+        "transport": "RTP/MP2T/TCP",
+    })
+}
+
+/// 构造 `VIDEO_LATENCY` 回报。
+///
+/// `latency:` 只报**相对发送方时间线的额外延迟**，即输出设备那一段。播放被钉在发送方 PTS 上，
+/// 队列里的 800 ms 只是发送方提前送来的缓冲，不让声音变晚；把它算进回报会让手机把歌词整体
+/// 推后近一秒。
 fn video_latency_request(cseq: u32, snapshot: MiPlayLatencySnapshot) -> String {
     format!(
         "VIDEO_LATENCY rtsp://localhost/wfd1.0 RTSP/1.0\r\n\
@@ -3010,7 +3059,7 @@ fn video_latency_request(cseq: u32, snapshot: MiPlayLatencySnapshot) -> String {
          bitrate:{}\r\n\
          rtpPacketNum:{}\r\n\
          Content-Length:0\r\n\r\n",
-        snapshot.latency_millis, snapshot.bitrate_bps, snapshot.rtp_packet_number,
+        snapshot.output_latency_millis, snapshot.bitrate_bps, snapshot.rtp_packet_number,
     )
 }
 
@@ -3051,17 +3100,33 @@ mod tests {
     use super::{
         AdtsFramer, ClockFitPoint, MAX_RTSP_MESSAGE_BYTES, MIPLAY_RTP_CLOCK_HZ,
         MIPLAY_SAMPLE_RATE_HZ, MIPLAY_SOURCE_CHANNELS, MiPlayLatencyTelemetry, PcmQueue,
-        StreamKeys, TsDemuxer, adts_bitrate, adts_sample_rate, decode_timer_sample,
-        extend_wrapping_counter, fit_clock_line, is_adts, normalized_output_latency_millis,
-        parse_rtp_packet, parse_timer_server, pes_private_data_iv, pes_pts_micros,
-        presentation_schedule_error_micros, rtp_payload, should_hard_drop_late_frames,
-        smooth_clock_model, synchronized_buffer_frames, trimmed_clock_offset,
-        try_parse_rtsp_message, usable_presentation_schedule_error_micros,
+        StreamKeys, TsDemuxer, adts_bitrate, adts_sample_rate, audio_format_event,
+        decode_timer_sample, extend_wrapping_counter, fit_clock_line, is_adts,
+        normalized_output_latency_millis, parse_rtp_packet, parse_timer_server,
+        pes_private_data_iv, pes_pts_micros, presentation_schedule_error_micros, rtp_payload,
+        should_hard_drop_late_frames, smooth_clock_model, synchronized_buffer_frames,
+        trimmed_clock_offset, try_parse_rtsp_message, usable_presentation_schedule_error_micros,
         validate_miplay_sample_rate, video_latency_request,
     };
     use aes::Aes128;
     use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::NoPadding};
     use std::time::{Duration as StdDuration, Instant};
+
+    #[test]
+    fn audio_format_event_marks_whether_the_bitrate_is_measured() {
+        let nominal = audio_format_event(320_000, 44_100, false, false);
+        assert_eq!(nominal["event"], "audio_format");
+        assert_eq!(nominal["bitrate"], 320_000);
+        assert_eq!(nominal["sample_rate"], 44_100);
+        assert_eq!(nominal["measured"], false);
+        assert_eq!(nominal["encrypted"], false);
+        assert_eq!(nominal["required_sample_rate"], MIPLAY_SAMPLE_RATE_HZ);
+
+        let measured = audio_format_event(348_000, MIPLAY_SAMPLE_RATE_HZ, true, true);
+        assert_eq!(measured["bitrate"], 348_000);
+        assert_eq!(measured["measured"], true);
+        assert_eq!(measured["encrypted"], true);
+    }
 
     #[test]
     fn validates_stream_key_lengths() {
@@ -3192,6 +3257,7 @@ mod tests {
 
         let snapshot = telemetry.snapshot().expect("RTP telemetry");
         assert_eq!(snapshot.latency_millis, 645);
+        assert_eq!(snapshot.output_latency_millis, 20);
         assert_eq!(snapshot.rtp_packet_number, 65_549);
         assert!(snapshot.bitrate_bps > 300_000);
         assert!(snapshot.arrival_residual_millis.abs() < 1.0);
@@ -3199,7 +3265,8 @@ mod tests {
         let request = video_latency_request(1_234, snapshot);
         assert!(request.starts_with("VIDEO_LATENCY rtsp://localhost/wfd1.0 RTSP/1.0\r\n"));
         assert!(request.contains("CSeq: 1234\r\n"));
-        assert!(request.contains("latency:645\r\n"));
+        // 只报输出设备这一段：队列深度不代表声音变晚（播放钉在发送方时间线上）。
+        assert!(request.contains("latency:20\r\n"));
         assert!(request.contains("rtpPacketNum:65549\r\n"));
         assert!(request.ends_with("Content-Length:0\r\n\r\n"));
     }
