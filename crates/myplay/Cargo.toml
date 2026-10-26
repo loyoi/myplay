@@ -1,6 +1,6 @@
 [package]
 name = "myplay"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 # 版本统一在根 `[workspace.dependencies]`；这里只保留成员自己的 feature 组合。
