@@ -5,7 +5,7 @@
 //! （当前 Tab、文本焦点、下拉开关、输出设备列表）；用户意图一律转发给 Core 的方法，
 //! Core 每次 `notify` 都触发本视图重绘。
 
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{Sizable, h_flex, spinner::Spinner, v_flex};
 use gpui_kit::*;
 
 use crate::channels::Snapshot;
@@ -13,6 +13,7 @@ use crate::core::app::{Core, NowPlaying, TextEdit, TextField};
 use crate::core::config::{CloseAction, DeviceKind, Source};
 use crate::core::state::RunState;
 use crate::platform::audio::{self, OutputDevice};
+use std::time::{Duration, Instant};
 
 /// 日志页最多渲染多少行（`uniform_list` 只渲染可见部分，这里只限制可回看的历史长度）。
 const LOG_VIEW_LIMIT: usize = 500;
@@ -21,6 +22,66 @@ const COVER_SIZE: Pixels = px(132.);
 /// 进度条高度与圆角（2px 圆角≈胶囊形，跟随条高）。
 const PROGRESS_HEIGHT: Pixels = px(3.);
 const PROGRESS_RADIUS: Pixels = px(2.);
+/// 加载遮罩出现前的保留时间：任务在这段时间内完成就根本不出遮罩，避免一闪而过。
+const LOADING_SHOW_DELAY: Duration = Duration::from_millis(200);
+/// 遮罩已出现后的最短停留时间，防止出现后立刻消失造成的闪烁。
+const LOADING_MIN_VISIBLE: Duration = Duration::from_millis(200);
+/// 遮罩轮询间隔：够细让遮罩及时出现，又不至于让界面每帧都醒一次。
+const LOADING_TICK: Duration = Duration::from_millis(40);
+
+/// 加载遮罩的当前阶段（纯界面时序状态，业务状态仍在 [`Core`] 里）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LoadingPhase {
+    /// 没有在途任务，也没有遮罩。
+    #[default]
+    Idle,
+    /// 有任务在途，但还在 [`LOADING_SHOW_DELAY`] 缓冲内：此时遮罩不显示。
+    Pending(Instant),
+    /// 遮罩已经画出来了：至少留到 `since + LOADING_MIN_VISIBLE`。
+    Visible(Instant),
+}
+
+impl LoadingPhase {
+    /// 遮罩此刻是否应该显示（只负责时序，不管业务是否还在跑）。
+    fn shows_overlay(self, now: Instant) -> bool {
+        match self {
+            Self::Idle => false,
+            Self::Pending(since) => now.saturating_duration_since(since) >= LOADING_SHOW_DELAY,
+            Self::Visible(_) => true,
+        }
+    }
+
+    /// 按「任务是否还在途」推进阶段，返回新阶段。
+    ///
+    /// 这条迁移是遮罩不闪的全部逻辑，因此单独成函数（单测只测它）：
+    /// - 任务开始 → `Pending(now)`，200 ms 内完成就从未显示过遮罩；
+    /// - 遮罩出现后任务就结束 → 转 `Visible(now)` 记下「该开始计最短停留」；
+    /// - 最短停留也满了 → 回 `Idle`。
+    fn advance(self, busy: bool, now: Instant) -> Self {
+        match (self, busy) {
+            (Self::Idle, false) => Self::Idle,
+            (Self::Idle, true) => Self::Pending(now),
+            (Self::Pending(since), true) => {
+                if now.saturating_duration_since(since) >= LOADING_SHOW_DELAY {
+                    // 越过延迟门槛即进入可见阶段，最短停留从现在起算。
+                    Self::Visible(now)
+                } else {
+                    Self::Pending(since)
+                }
+            }
+            // 还在缓冲里就结束了：遮罩一次都没画出来，直接收。
+            (Self::Pending(_), false) => Self::Idle,
+            (Self::Visible(since), false) => {
+                if now.saturating_duration_since(since) >= LOADING_MIN_VISIBLE {
+                    Self::Idle
+                } else {
+                    Self::Visible(since)
+                }
+            }
+            (Self::Visible(since), true) => Self::Visible(since),
+        }
+    }
+}
 
 /// 右侧页面。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +127,10 @@ pub struct SettingsView {
     audio_open: bool,
     /// 枚举到的输出设备（打开页面时枚举一次；切换设备不重新枚举）。
     audio_devices: Vec<OutputDevice>,
+    /// 加载遮罩的时序阶段（延迟出现 + 最短停留）。
+    loading: LoadingPhase,
+    /// 遮罩轮询任务是否已经跑着（在途任务只开一个泵）。
+    loading_ticking: bool,
 }
 
 impl SettingsView {
@@ -82,6 +147,8 @@ impl SettingsView {
             log_scroll: UniformListScrollHandle::new(),
             audio_open: false,
             audio_devices: audio::list_output_devices(),
+            loading: LoadingPhase::Idle,
+            loading_ticking: false,
         }
     }
 
@@ -111,19 +178,100 @@ impl SettingsView {
             false
         });
     }
+
+    /// 翻转开机自启：意图交给 Core（它在后台写注册表），这里负责把遮罩计时拉起来。
+    fn toggle_autostart(&mut self, cx: &mut Context<Self>) {
+        self.core
+            .update(cx, |core, cx| core.toggle_start_with_windows(cx));
+        self.sync_loading(cx);
+    }
+
+    /// 推进加载遮罩：按「业务是否还在途」与时间缓冲计算当前应处于哪个阶段。
+    ///
+    /// 遮罩本身就是一层视觉反馈，所以完全由界面计时驱动：
+    /// - 任务开始后先等 [`LOADING_SHOW_DELAY`]，快任务根本不出遮罩（不闪）；
+    /// - 遮罩一旦出现，至少留 [`LOADING_MIN_VISIBLE`]；
+    /// - 需要时只开一个轮询任务，空闲后自动退出，不成常驻计时器。
+    fn sync_loading(&mut self, cx: &mut Context<Self>) {
+        let busy = self.core.read(cx).autostart.is_applying();
+        let before = self.loading;
+        self.loading = self.loading.advance(busy, Instant::now());
+        if self.loading != before {
+            cx.notify();
+        }
+        // 还有待完成的事（在途任务或遮罩的最短停留）才开表。
+        let waiting = busy || self.loading != LoadingPhase::Idle;
+        if !waiting || self.loading_ticking {
+            return;
+        }
+        self.loading_ticking = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(LOADING_TICK).await;
+                // `Ok(true)` = 收尾；`Err(_)` = 视图已释放（窗口关了），泵自然退出。
+                let finished = this.update(cx, |view, cx| {
+                    let busy = view.core.read(cx).autostart.is_applying();
+                    view.loading = view.loading.advance(busy, Instant::now());
+                    cx.notify();
+                    let finished = !busy && view.loading == LoadingPhase::Idle;
+                    if finished {
+                        view.loading_ticking = false;
+                    }
+                    finished
+                });
+                if !matches!(finished, Ok(false)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
 }
 
 // ---------------------------------------------------------------- 渲染
 
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
+        // 遮罩是否显示由时序阶段决定；在途任务由泵在后台推进，渲染本身不改状态。
+        let overlay = self.loading.shows_overlay(Instant::now());
+        let mut root = h_flex()
             .size_full()
+            .relative()
             .bg(rgb(0x16171b))
             .text_color(rgb(0xdfe3ea))
             .child(self.render_sidebar(cx))
-            .child(self.render_content(cx))
+            .child(self.render_content(cx));
+        if overlay {
+            root = root.child(render_loading_overlay());
+        }
+        root
     }
+}
+
+/// 加载遮罩：盖住整个窗口内容并拦住点击（加遮罩的同时禁止重复操作）。
+fn render_loading_overlay() -> impl IntoElement {
+    div()
+        .id("loading-overlay")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        // 遮罩底色：带 alpha 的深色（`rgba` 的 hex 是 0xRRGGBBAA），约 67% 不透明。
+        .bg(gpui_kit::rgba(0x0d0e11aa))
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(0x22252b))
+                .border_1()
+                .border_color(rgb(0x33363d))
+                .child(Spinner::new().small().color(rgb(0xa8aebb).into()))
+                .child(div().text_sm().text_color(rgb(0xdfe3ea)).child("正在应用…")),
+        )
 }
 
 impl SettingsView {
@@ -295,8 +443,7 @@ impl SettingsView {
                         "toggle-boot",
                         start_with_windows,
                         cx.listener(|view, _, _, cx| {
-                            view.core
-                                .update(cx, |core, cx| core.toggle_start_with_windows(cx));
+                            view.toggle_autostart(cx);
                         }),
                     ))
                     .child(toggle_row(
@@ -1023,4 +1170,70 @@ fn toggle_row(
                 .child(if on { "✓" } else { " " }),
         )
         .child(div().text_sm().text_color(rgb(0xdfe3ea)).child(label))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LOADING_MIN_VISIBLE, LOADING_SHOW_DELAY, LoadingPhase};
+    use std::time::{Duration, Instant};
+
+    /// 阶段推进只依赖「任务是否在途」与时间，因此用假时间点驱动，不碰真实计时器。
+    fn at(base: Instant, millis: u64) -> Instant {
+        base + Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn fast_task_never_shows_overlay() {
+        let start = Instant::now();
+        // 任务在 200 ms 缓冲内完成：全程都不该显示遮罩。
+        let phase = LoadingPhase::Idle.advance(true, start);
+        assert!(!phase.shows_overlay(at(start, 0)));
+        let phase = phase.advance(true, at(start, 150));
+        assert!(!phase.shows_overlay(at(start, 150)));
+        let phase = phase.advance(false, at(start, 180));
+        assert_eq!(phase, LoadingPhase::Idle);
+        assert!(!phase.shows_overlay(at(start, 180)));
+    }
+
+    #[test]
+    fn slow_task_shows_overlay_after_delay() {
+        let start = Instant::now();
+        let phase = LoadingPhase::Idle.advance(true, start);
+        // 越过延迟门槛才可见。
+        let phase = phase.advance(true, at(start, LOADING_SHOW_DELAY.as_millis() as u64));
+        assert!(phase.shows_overlay(at(start, 200)));
+    }
+
+    #[test]
+    fn overlay_holds_for_minimum_visible_time() {
+        let start = Instant::now();
+        let shown = LoadingPhase::Idle
+            .advance(true, start)
+            .advance(true, at(start, 200));
+        assert!(shown.shows_overlay(at(start, 200)));
+
+        // 任务立刻结束：遮罩进入「最短停留」并从此刻开始计时。
+        let holding = shown.advance(false, at(start, 210));
+        assert!(holding.shows_overlay(at(start, 210)));
+        // 停留期内仍然可见，不会闪一下就没。
+        let still = holding.advance(false, at(start, 210 + 100));
+        assert!(still.shows_overlay(at(start, 310)));
+        // 停留期满才收起。
+        let done = still.advance(
+            false,
+            at(start, 210 + LOADING_MIN_VISIBLE.as_millis() as u64),
+        );
+        assert_eq!(done, LoadingPhase::Idle);
+    }
+
+    #[test]
+    fn new_task_extends_existing_overlay() {
+        let start = Instant::now();
+        let shown = LoadingPhase::Idle
+            .advance(true, start)
+            .advance(true, at(start, 200));
+        // 连续提交：已经可见的遮罩不该被重置回 Pending（否则会闪一下消失再出现）。
+        let again = shown.advance(true, at(start, 400));
+        assert!(again.shows_overlay(at(start, 400)));
+    }
 }

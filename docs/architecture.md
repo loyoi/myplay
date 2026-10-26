@@ -99,6 +99,7 @@ channels (L4) ──EventSink(flume, 有界, 传 UiEvent)──▶ Core 事件�
 | `myplay-dlna-decode` | `channels/dlna_player.rs` | 拉流 + 解码，按「代次」响应 Stop / 换曲 / seek |
 | `myplay-artwork` | `core/app.rs` | 串行下载封面（连续换曲只保留最后一个地址），解码在封面泵里做 |
 | `myplay-log` | `core/app.rs` | 事件日志落盘（`platform::system::LogWriter` 常驻句柄） |
+| `myplay-autostart` | `core/app.rs` | 开机自启写注册表 + 落盘；结果经独立泵回到 `Core`（界面不阻塞） |
 
 音频回调（cpal 线程）不分配内存、不做字符串处理：采样缓冲按输出格式一次性预留，
 满时由 `Condvar` 唤醒解码线程，暂停/空缓冲输出静音。

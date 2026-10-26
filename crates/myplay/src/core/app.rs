@@ -32,6 +32,37 @@ const ARTWORK_QUEUE: usize = 4;
 /// 封面单张最大字节数，防止一条超链接吃光内存。
 const ARTWORK_LIMIT: u64 = 8 * 1024 * 1024;
 
+/// 开机自启的异步状态。
+///
+/// 注册表读写与配置落盘都做成后台任务（早先是界面线程同步跑 `reg.exe`，切换时整页冻结），
+/// 这里只反映「是否还有一次写操作在路上」，界面据此出加载层并拒绝重复提交。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Autostart {
+    /// 空闲：没有在途操作，显示的就是当前真实状态。
+    #[default]
+    Idle,
+    /// 正在写注册表并落盘；`generation` 用来丢弃被后续请求超越的旧结果。
+    Applying {
+        /// 发起这次写操作时分配的序号。
+        generation: u64,
+    },
+}
+
+impl Autostart {
+    /// 是否有一次自启写操作在途（界面据此出加载层）。
+    pub const fn is_applying(self) -> bool {
+        matches!(self, Self::Applying { .. })
+    }
+}
+
+/// 后台自启任务的执行结果（经泵回到 [`Core`]）。
+struct AutostartOutcome {
+    /// 发起请求时的序号：比当前小的结果说明已被后来的请求取代，直接丢弃。
+    generation: u64,
+    /// 注册表操作是否成功。
+    result: anyhow::Result<()>,
+}
+
 /// 当前播放信息（由通道事件累积；停止接收时整体复位）。
 #[derive(Default)]
 pub struct NowPlaying {
@@ -183,8 +214,14 @@ pub struct Core {
     pub tracks: u32,
     /// 只读：媒体流重建次数。
     pub reconnects: u32,
+    /// 只读：开机自启的异步状态（是否有写操作在途）。
+    pub autostart: Autostart,
     /// 本次启动是否只驻留托盘（不建窗口）；只生效一次。
     start_minimized_pending: bool,
+    /// 自启写操作的序号：每发起一次自增，用来丢弃被超越的旧结果。
+    autostart_generation: u64,
+    /// 自启任务入口（写注册表 + 落盘由后台线程串行执行）。
+    autostart_tx: flume::Sender<(u64, bool)>,
     /// 封面下载请求入口（下载线程串行处理并合并连续换曲）。
     artwork_request_tx: flume::Sender<String>,
     /// 交给通道的事件入口（克隆给每条通道）。
@@ -270,6 +307,36 @@ impl Core {
             log::error!("无法启动日志线程：{error}");
         }
 
+        // 自启任务通道：界面线程只发意图，注册表读写与配置落盘都在下面的线程里完成，
+        // 结果经 `autostart_outcome` 泵回本实体（与事件泵同一套路，不阻塞界面）。
+        let (autostart_tx, autostart_rx) = flume::unbounded::<(u64, bool)>();
+        let (autostart_outcome_tx, autostart_outcome_rx) = flume::unbounded::<AutostartOutcome>();
+        let outcome_tx = autostart_outcome_tx.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("myplay-autostart".to_owned())
+            .spawn(move || {
+                while let Ok((generation, enabled)) = autostart_rx.recv() {
+                    // 旧请求被新请求覆盖时不必真写：只落最后一次的意图。
+                    let (generation, enabled) = autostart_rx
+                        .try_iter()
+                        .last()
+                        .unwrap_or((generation, enabled));
+                    let result = system::set_autostart(enabled);
+                    let _ = outcome_tx.send(AutostartOutcome { generation, result });
+                }
+            })
+        {
+            log::error!("无法启动自启线程：{error}");
+        }
+
+        // 自启结果泵：worker 线程 → Core（只做内存更新与刷新，不碰文件）。
+        cx.spawn(async move |this, cx| {
+            while let Ok(outcome) = autostart_outcome_rx.recv_async().await {
+                let _ = this.update(cx, |core, cx| core.finish_autostart(outcome, cx));
+            }
+        })
+        .detach();
+
         let start_minimized_pending = settings.start_minimized;
         let mut core = Self {
             settings,
@@ -285,6 +352,9 @@ impl Core {
             tracks: 0,
             reconnects: 0,
             start_minimized_pending,
+            autostart: Autostart::Idle,
+            autostart_generation: 0,
+            autostart_tx,
             artwork_request_tx,
             sink,
             channel: None,
@@ -294,8 +364,13 @@ impl Core {
         };
         // 先推一次初始状态，托盘一挂上就有正确 tooltip。
         core.publish_status();
+        // 自启的真实状态以注册表为准：`settings.json` 里的值可能已经过期
+        // （用户在其它工具里删了 Run 项，或者手动改过注册表）。
+        core.sync_autostart_from_registry(cx);
         core
     }
+
+    // ------------------------------------------------------------ 开机自启
 
     // ------------------------------------------------------------ 生命周期
 
@@ -447,18 +522,25 @@ impl Core {
         self.restart_if_running(move |core| core.settings.output_device = id, cx);
     }
 
-    /// 开关开机自启：写盘 + 操作注册表 + 记日志。
+    /// 切换开机自启：先乐观更新显示，再交给后台线程写注册表 + 落盘。
+    ///
+    /// 早先这里是同步调 `reg.exe`，一次往返几百毫秒、整页冻结；
+    /// 现在界面只负责把意图发出去，结果由 [`Self::finish_autostart`] 回来时收尾。
+    /// 写操作在途时忽略新的点击（防重复提交），界面同时盖加载层。
     pub fn set_start_with_windows(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.settings.start_with_windows = enabled;
-        match system::set_autostart(enabled) {
-            Ok(()) => self.push_log(if enabled {
-                "已开启开机自启"
-            } else {
-                "已关闭开机自启"
-            }),
-            Err(error) => self.push_log(format!("开机自启设置失败：{error:#}")),
+        if self.autostart.is_applying() || self.settings.start_with_windows == enabled {
+            return;
         }
-        self.settings.save();
+        self.settings.start_with_windows = enabled;
+        self.autostart_generation += 1;
+        let generation = self.autostart_generation;
+        self.autostart = Autostart::Applying { generation };
+        if self.autostart_tx.send((generation, enabled)).is_err() {
+            // 线程已退出（没启动成功）：退回到真实注册表状态，不要留下假的勾选。
+            self.autostart = Autostart::Idle;
+            self.sync_autostart_from_registry(cx);
+            return;
+        }
         cx.notify();
     }
 
@@ -466,6 +548,49 @@ impl Core {
     pub fn toggle_start_with_windows(&mut self, cx: &mut Context<Self>) {
         let enabled = !self.settings.start_with_windows;
         self.set_start_with_windows(enabled, cx);
+    }
+
+    /// 后台写操作回来了：记日志、清在途标记、以注册表为准回写配置。
+    ///
+    /// `outcome.generation` 比当前序号小说明这个结果已被后来的请求取代，直接丢弃。
+    fn finish_autostart(&mut self, outcome: AutostartOutcome, cx: &mut Context<Self>) {
+        if self.autostart_generation != outcome.generation {
+            return;
+        }
+        self.autostart = Autostart::Idle;
+        match outcome.result {
+            // 成功后不再读注册表：刚写的值就是真相，多一次往返只会让遮罩多停一瞬。
+            Ok(()) => {
+                let text = if self.settings.start_with_windows {
+                    "已开启开机自启"
+                } else {
+                    "已关闭开机自启"
+                };
+                self.push_log(text);
+                self.settings.save();
+            }
+            Err(error) => {
+                self.push_log(format!("开机自启设置失败：{error:#}"));
+                // 失败时按注册表真实状态刷新显示，不能让复选框停在用户想要的假值上。
+                self.sync_autostart_from_registry(cx);
+                self.settings.save();
+            }
+        }
+        cx.notify();
+    }
+
+    /// 读注册表真实状态覆盖 `settings.start_with_windows`（注册表是唯一真相），有变化就落盘。
+    fn sync_autostart_from_registry(&mut self, cx: &mut Context<Self>) {
+        match system::is_autostart_enabled() {
+            Ok(enabled) => {
+                if self.settings.start_with_windows != enabled {
+                    self.settings.start_with_windows = enabled;
+                    self.settings.save();
+                }
+            }
+            Err(error) => log::warn!("读取开机自启状态失败：{error:#}"),
+        }
+        cx.notify();
     }
 
     /// 开关「启动后最小化到托盘」（下次启动生效）。
@@ -777,7 +902,7 @@ fn host_of(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{StatusSummary, TextField, host_of, stage_label};
+    use super::{Autostart, StatusSummary, TextField, host_of, stage_label};
     use crate::core::config::Settings;
     use crate::core::state::RunState;
 
@@ -826,5 +951,12 @@ mod tests {
     fn unknown_stage_uses_generic_label() {
         assert_eq!(stage_label("whatever"), "协商中");
         assert_eq!(stage_label("secure_channel_established"), "鉴权通过");
+    }
+
+    /// 只有 `Applying` 算「在途」：界面靠它出遮罩并拦重复点击。
+    #[test]
+    fn only_applying_blocks_new_requests() {
+        assert!(!Autostart::Idle.is_applying());
+        assert!(Autostart::Applying { generation: 1 }.is_applying());
     }
 }

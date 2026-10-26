@@ -41,6 +41,8 @@ windows = { workspace = true, features = [
   "Win32_UI_WindowsAndMessaging",
   # `AttachThreadInput` / `GetCurrentThreadId`：启动时把主窗口抢到前台（借前台线程的输入权限）。
   "Win32_System_Threading",
+  # 开机自启：直接读写 HKCU 的 Run 键，不再起 `reg.exe` 子进程（子进程会让切换卡顿）。
+  "Win32_System_Registry",
 ] }
 
 [build-dependencies]
