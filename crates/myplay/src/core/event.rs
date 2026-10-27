@@ -16,8 +16,12 @@ pub enum UiEvent {
         remote: Option<String>,
         stage: String,
     },
-    /// 对端设备名。
-    Source { name: String },
+    /// 对端设备名，以及它在能力协商里上报的能力摘要。
+    Source {
+        name: String,
+        /// `SET_DEVICE_INFO` 原始表的可读摘要（已剔凭据类键与空值，见 [`capability_summary`]）。
+        capability_summary: String,
+    },
     /// 输出设备就绪。
     OutputReady { name: String },
     /// 开始接收媒体流。
@@ -71,6 +75,7 @@ pub fn parse_value(value: &Value) -> Option<UiEvent> {
         },
         "source_info" => UiEvent::Source {
             name: text("source_name"),
+            capability_summary: value.get("raw").map(capability_summary).unwrap_or_default(),
         },
         "audio_output_ready" => UiEvent::OutputReady {
             name: text("device_name"),
@@ -122,6 +127,56 @@ pub fn parse_value(value: &Value) -> Option<UiEvent> {
     })
 }
 
+/// 从能力协商（`SET_DEVICE_INFO`）的原始表里挑出「协商了什么」的可读摘要。
+///
+/// 手机端在这张表里上报自己的能力和需求（`support`、`needLrc`、`needPos`、`channel`、
+/// `deviceType` 等）。这里按表格原样输出、不猜字段含义：只跳过凭据类键与空值，
+/// 并限制条目数与长度，避免一条日志把日志页刷爆。
+fn capability_summary(raw: &Value) -> String {
+    /// 凭据类键：即使对端上报了也不进日志。
+    const SKIP_KEYS: [&str; 8] = [
+        "sn",
+        "token",
+        "accesstoken",
+        "key",
+        "secret",
+        "password",
+        "pwd",
+        "sign",
+    ];
+    /// 最多列几项、单项多长、整体多长（日志页一行）。
+    const MAX_ITEMS: usize = 8;
+    const MAX_VALUE: usize = 32;
+    const MAX_TOTAL: usize = 160;
+
+    let Some(table) = raw.as_object() else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    for (key, value) in table {
+        if parts.len() == MAX_ITEMS {
+            break;
+        }
+        if SKIP_KEYS.iter().any(|skip| key.eq_ignore_ascii_case(skip)) {
+            continue;
+        }
+        let text = match value {
+            Value::String(text) => text.trim().to_owned(),
+            Value::Number(number) => number.to_string(),
+            Value::Bool(flag) => flag.to_string(),
+            // 嵌套表/数组按 JSON 原样打印，够看就行。
+            Value::Object(_) | Value::Array(_) => value.to_string(),
+            Value::Null => continue,
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let text: String = text.chars().take(MAX_VALUE).collect();
+        parts.push(format!("{key}={text}"));
+    }
+    parts.join(" · ").chars().take(MAX_TOTAL).collect()
+}
+
 /// 取一个可选字符串字段（缺失、`null`、非字符串都视为 `None`）。
 pub fn opt_text(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_owned)
@@ -139,7 +194,7 @@ pub fn number(value: &Value, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{UiEvent, parse_value};
+    use super::{UiEvent, capability_summary, parse_value};
     use serde_json::json;
 
     /// 测试用：从 JSON 文本走一遍值解析。
@@ -199,6 +254,51 @@ mod tests {
         assert_eq!(
             super::parse_value(&valid),
             Some(UiEvent::Volume { percent: 42 })
+        );
+    }
+
+    /// 能力协商日志只列能力和需求，不带凭据、不列空值。
+    #[test]
+    fn capabilities_skip_credentials_and_empty_values() {
+        let raw = json!({
+            "sourceName": "Xiaomi Pad 7",
+            "support": "audio",
+            "needLrc": "1",
+            "needAblum": "0",
+            "channel": "",
+            "sn": "ABC123",
+            "token": "secret-token",
+        });
+        let summary = capability_summary(&raw);
+        assert!(summary.contains("support=audio"), "{summary}");
+        assert!(summary.contains("needLrc=1"), "{summary}");
+        assert!(summary.contains("needAblum=0"), "{summary}");
+        assert!(!summary.contains("ABC123"), "{summary}");
+        assert!(!summary.contains("secret-token"), "{summary}");
+        assert!(!summary.contains("channel="), "{summary}");
+    }
+
+    /// 非对象（没拿到原始表）时不产出摘要，日志里就不带括号。
+    #[test]
+    fn capabilities_are_empty_without_a_table() {
+        assert_eq!(capability_summary(&json!("audio")), "");
+        assert_eq!(capability_summary(&json!(null)), "");
+    }
+
+    /// `source_info` 把原始表转成能力摘要，供能力协商那一行打印。
+    #[test]
+    fn source_info_carries_capabilities() {
+        let event = json!({
+            "event": "source_info",
+            "source_name": "Xiaomi Pad 7",
+            "raw": {"support": "audio", "needPos": "1"},
+        });
+        assert_eq!(
+            super::parse_value(&event),
+            Some(UiEvent::Source {
+                name: "Xiaomi Pad 7".to_owned(),
+                capability_summary: capability_summary(&event["raw"]),
+            })
         );
     }
 }

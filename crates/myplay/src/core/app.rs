@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::io::Read as _;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::*;
 
@@ -31,6 +31,39 @@ const EVENT_QUEUE: usize = 1024;
 const ARTWORK_QUEUE: usize = 4;
 /// 封面单张最大字节数，防止一条超链接吃光内存。
 const ARTWORK_LIMIT: u64 = 8 * 1024 * 1024;
+/// 自动启动失败后的重试间隔。
+///
+/// 开机自启时网卡往往还没拿到 IPv4、mDNS/SSDP 端口也还没就绪，
+/// 这段空窗通常在几秒内结束，所以按秒级轮询就够，不必做事件订阅。
+const AUTO_START_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// 自动启动的重试窗口：超过它还没成功就停在 `Failed`，把原因留给用户判断。
+/// 不无限重试，避免接收器在用户早就放弃之后突然自己上线。
+const AUTO_START_WINDOW: Duration = Duration::from_secs(90);
+/// 连续「运行中」多久才算真的启动成功。
+///
+/// DLNA 通道是先返回成功、服务失败再由核心异步回报的，刚起来的 `Running`
+/// 不能直接当成成功，要守一小段确认。
+const AUTO_START_STABLE: Duration = Duration::from_secs(5);
+/// 重试期间跟在失败原因后面的提示：让用户知道它在自己重试，而不是已经放弃。
+const RETRY_HINT: &str = "（等待网络就绪后自动重试）";
+/// 网卡未就绪时的状态说明：界面靠它告诉用户「还没起来是因为在等网络」。
+const NO_NETWORK: &str = "等待网络就绪后自动启动";
+/// 重试窗口到期而网络仍未就绪。
+const NO_NETWORK_TIMEOUT: &str = "等待网络就绪超时，请手动启动";
+/// 重试窗口到期而通道仍起不来（真实原因另外留在 `detail`）。
+const RETRY_TIMEOUT: &str = "自动启动重试超时，请手动启动或检查网络";
+
+/// 启动失败时要不要写事件日志。
+///
+/// 开机重试每 2 秒就可能失败一次，写进日志页会把真正的历史刷掉；
+/// 但用户手动启动失败必须留一行。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailureLog {
+    /// 写进事件日志（用户手动启动）。
+    Record,
+    /// 只写控制台/日志文件（自动重试）。
+    Quiet,
+}
 
 /// 开机自启的异步状态。
 ///
@@ -193,7 +226,9 @@ pub struct Core {
     pub settings: Settings,
     /// 只读：接收器状态机的当前状态。
     pub status: RunState,
-    /// 只读：给用户看的一句话说明（上线地址、失败原因等）。
+    /// 只读：状态补充说明，空表示徽标已经说清楚。
+    /// 只有失败原因、等待网络、重试中这类徽标放不下的信息才写，「已上线」
+    /// 「未启动」这种重复徽标的文案不写。
     pub detail: String,
     /// 只读：妙播通道的广播信息快照（其它通道为 `None`）。
     pub snapshot: Option<Snapshot>,
@@ -206,6 +241,9 @@ pub struct Core {
     /// 只读：事件日志（最新在尾部，上限 [`LOG_LIMIT`] 行）。用 `SharedString`
     /// 让界面重绘只克隆引用，不复制文本。
     pub log: VecDeque<SharedString>,
+    /// 只读：日志版本号，每次追加或清空自增。
+    /// 日志页据此判断「要不要重拼一次整段文本」（`set_value` 会重置选择与滚动，不能每帧覆盖）。
+    pub log_revision: u64,
     /// 只读：实际在用的输出设备名（由通道事件回填）。
     pub active_output: Option<String>,
     /// 只读：本次启动时刻，用于界面显示运行时长。
@@ -220,6 +258,15 @@ pub struct Core {
     start_minimized_pending: bool,
     /// 自启写操作的序号：每发起一次自增，用来丢弃被超越的旧结果。
     autostart_generation: u64,
+    /// 自动启动重试的代次：用户手动启停会推进它，在途的重试循环据此退位。
+    auto_start_generation: u64,
+    /// 对端最近一次上报的能力摘要（来自 `SET_DEVICE_INFO`）。
+    source_capability_summary: String,
+    /// 上一行「握手：…」日志：同一句重复上报时不再刷一行。
+    last_stage_log: String,
+    /// 最近一次启动失败的原始原因（`detail` 会附上「正在重试」之类的提示，
+    /// 收手时用它还原成干净的原因）。
+    last_failure: String,
     /// 自启任务入口（写注册表 + 落盘由后台线程串行执行）。
     autostart_tx: flume::Sender<(u64, bool)>,
     /// 封面下载请求入口（下载线程串行处理并合并连续换曲）。
@@ -347,6 +394,7 @@ impl Core {
             peer: String::new(),
             stage: String::new(),
             log: VecDeque::new(),
+            log_revision: 0,
             active_output: None,
             started_at: None,
             tracks: 0,
@@ -354,6 +402,10 @@ impl Core {
             start_minimized_pending,
             autostart: Autostart::Idle,
             autostart_generation: 0,
+            auto_start_generation: 0,
+            last_failure: String::new(),
+            source_capability_summary: String::new(),
+            last_stage_log: String::new(),
             autostart_tx,
             artwork_request_tx,
             sink,
@@ -374,14 +426,57 @@ impl Core {
 
     // ------------------------------------------------------------ 生命周期
 
-    /// 启动接收器（幂等：非 Idle/Failed 状态直接忽略）。
+    /// 启动接收器（用户意图：失败就停在 `Failed`，不做自动重试）。
     pub fn start(&mut self, cx: &mut Context<Self>) {
+        // 用户手动启动：在途的自动重试必须退位，免得两边各起一个接收器。
+        self.cancel_auto_start();
+        self.start_once(FailureLog::Record, cx);
+    }
+
+    /// 开机自启 / 上次退出时在运行的还原启动（网卡未就绪时等它，失败自动重试）。
+    ///
+    /// 开机瞬间网卡常常还没拿到 IPv4（mDNS 广播、SSDP 组播都要地址），直接判失败会让
+    /// 接收器停在「错误」再也不动——这正是「开机自启后设备搜不到」的根因。
+    /// 因此这里先把意图记下来：网卡没就绪就不去起通道（只会失败并刷日志），
+    /// 就绪后每 `AUTO_START_RETRY_INTERVAL` 守到 `AUTO_START_WINDOW` 为止；
+    /// 期间用户手动启停立刻让位。
+    pub fn restore_start(&mut self, cx: &mut Context<Self>) {
         if !self.status.can_start() {
             return;
         }
+        self.cancel_auto_start();
+        let generation = self.auto_start_generation;
+        // 先把「要开着」记下来：本次开机即使起不来，下次也得继续还原。
+        self.remember_running(true);
+        // 进入监护循环前已经试过一次，日志里的「第 N 次」要从它算起。
+        let mut attempts = 0;
+        if channels::lan_ready() {
+            attempts += 1;
+            if !self.start_once(FailureLog::Quiet, cx) {
+                // 逐次失败不写事件日志（每 2 秒一条会刷满日志页），只在开头说明一次。
+                self.mark_retrying();
+                self.push_log(format!("自动启动失败：{}；稍后自动重试", self.last_failure));
+                cx.notify();
+            }
+        } else {
+            self.detail = NO_NETWORK.to_owned();
+            self.push_log("自动启动：网络还没就绪，就绪后自动启动");
+            cx.notify();
+        }
+        self.watch_auto_start(generation, attempts, cx);
+    }
+
+    /// 真正执行一次启动；自动重试走 [`FailureLog::Quiet`]，不往日志页刷失败。
+    ///
+    /// 返回是否起来：通道线程已拉起（DLNA 的服务失败会稍后经事件回报）。
+    fn start_once(&mut self, failure_log: FailureLog, cx: &mut Context<Self>) -> bool {
+        if !self.status.can_start() {
+            return false;
+        }
         // 出错态可能还留着旧通道：先停干净再起，避免两个接收器抢端口/mDNS。
+        // 这里传 `false`：紧接着就 `remember_running(true)`，不必先落一次「不还原」。
         if self.channel.is_some() {
-            self.stop(cx);
+            self.stop_channel(false, cx);
         }
         // 启停按钮的另一半职责：记下「要开着」，下次启动按它还原。
         self.remember_running(true);
@@ -391,35 +486,120 @@ impl Core {
             Ok(channel) => {
                 self.snapshot = channel.snapshot().cloned();
                 self.set_status(RunState::Running);
-                self.detail = "已上线".to_owned();
+                self.detail.clear();
                 self.started_at = Some(Instant::now());
                 self.tracks = 0;
                 self.reconnects = 0;
                 self.playing = NowPlaying::default();
                 self.peer.clear();
                 self.stage.clear();
+                self.source_capability_summary.clear();
+                self.last_stage_log.clear();
                 self.active_output = None;
+                self.last_failure.clear();
                 self.push_log(format!("接收器已启动（{source}）"));
                 log::info!("接收器已启动（{source}）");
                 self.channel = Some(channel);
+                self.changed(cx);
+                true
             }
             Err(error) => {
                 self.set_status(RunState::Failed);
-                self.detail = format!("{error:#}");
-                self.push_log(format!("启动{source}失败：{error:#}"));
+                self.last_failure = format!("{error:#}");
+                self.detail = self.last_failure.clone();
+                if failure_log == FailureLog::Record {
+                    self.push_log(format!("启动{source}失败：{error:#}"));
+                }
                 log::info!("启动{source}失败：{error:#}");
+                self.changed(cx);
+                false
             }
         }
-        self.changed(cx);
+    }
+
+    /// 自动启动的监护循环：网卡就绪/失败后重试，稳定运行满 [`AUTO_START_STABLE`] 才算成功。
+    ///
+    /// 用 `WeakEntity`，Core 释放后循环自然退出；用户手动启停会推进代次让循环收手。
+    /// `initial_attempts` 是进入循环前已经试过的次数（只用于「第 N 次成功」那句日志）。
+    fn watch_auto_start(&mut self, generation: u64, initial_attempts: u32, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut watch = AutoStartWatch::new(Instant::now(), initial_attempts);
+            loop {
+                cx.background_executor()
+                    .timer(AUTO_START_RETRY_INTERVAL)
+                    .await;
+                // `Some(())` = 继续守；`None` = 收手（`Err` 表示实体已释放）。
+                let kept = this.update(cx, |core, cx| {
+                    if core.auto_start_generation != generation {
+                        return None;
+                    }
+                    match watch.next(core.status, channels::lan_ready(), Instant::now()) {
+                        AutoStartStep::Start => {
+                            // 起来后继续守着：DLNA 的服务失败是异步回报的，
+                            // 乐观的 `Running` 不能当成成功，下一拍还要复核。
+                            if !core.start_once(FailureLog::Quiet, cx) {
+                                core.mark_retrying();
+                            }
+                            Some(())
+                        }
+                        AutoStartStep::Wait => Some(()),
+                        AutoStartStep::Stable => {
+                            // 只在真的重试过之后才报一句：首次就成功时用户不需要这条。
+                            if watch.attempts > 1 {
+                                let attempts = watch.attempts;
+                                let source = core.settings.source.label();
+                                core.push_log(format!(
+                                    "自动启动：第 {attempts} 次尝试成功（{source}）"
+                                ));
+                                cx.notify();
+                            }
+                            None
+                        }
+                        AutoStartStep::Expired => {
+                            if core.status == RunState::Failed {
+                                // 把「还在重试」的提示收回去，只留真实原因。
+                                core.detail = core.last_failure.clone();
+                                core.push_log(RETRY_TIMEOUT);
+                            } else if !core.is_running() {
+                                core.detail = NO_NETWORK_TIMEOUT.to_owned();
+                                core.push_log("自动启动超时：网络仍未就绪，请手动启动");
+                            } else {
+                                // 已经在跑，只是没坐满 [`AUTO_START_STABLE`]：没什么要提醒的。
+                                return None;
+                            }
+                            cx.notify();
+                            None
+                        }
+                    }
+                });
+                if !matches!(kept, Ok(Some(()))) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 推进代次让在途的自动重试循环收手（用户手动启停 / 重新还原启动时调用）。
+    fn cancel_auto_start(&mut self) {
+        self.auto_start_generation += 1;
+    }
+
+    /// 重试期间把失败原因标成「正在重试」，避免用户看到「错误」就以为它放弃了自己。
+    fn mark_retrying(&mut self) {
+        self.detail = format!("{}{RETRY_HINT}", self.last_failure);
     }
 
     /// 停止接收器（幂等：没有通道、状态机也不允许停止时直接返回）。
     pub fn stop(&mut self, cx: &mut Context<Self>) {
+        // 用户主动停止：在途的自动重试必须退位，不能过两秒又自己起来。
+        self.cancel_auto_start();
         self.stop_channel(true, cx);
     }
 
     /// 退出前收尾：停通道（发 byebye）但**保留**「上次是运行状态」，下次启动照旧还原。
     pub fn shutdown(&mut self, cx: &mut Context<Self>) {
+        self.cancel_auto_start();
         self.stop_channel(false, cx);
     }
 
@@ -437,13 +617,16 @@ impl Core {
             channel.stop();
         }
         self.set_status(RunState::Idle);
-        self.detail = "未启动".to_owned();
+        self.detail.clear();
+        self.last_failure.clear();
         self.snapshot = None;
         self.started_at = None;
         // 停止后「信息」页不该残留上一次的播放与连接状态。
         self.playing = NowPlaying::default();
         self.peer.clear();
         self.stage.clear();
+        self.source_capability_summary.clear();
+        self.last_stage_log.clear();
         self.active_output = None;
         self.tracks = 0;
         self.reconnects = 0;
@@ -480,7 +663,16 @@ impl Core {
     /// 清空事件日志（界面「清空」按钮）。
     pub fn clear_log(&mut self, cx: &mut Context<Self>) {
         self.log.clear();
+        self.log_revision += 1;
         cx.notify();
+    }
+
+    /// 整段日志文本（最新在前，与日志页的阅读顺序一致）。
+    ///
+    /// 日志页把它整个写进只读文本框；选中与复制都交给那个控件。
+    /// 每次调用都会拼一遍，调用方自己用 `log_revision` 把频率控在「有新行才拼」。
+    pub fn log_text(&self) -> String {
+        log_text_of(&self.log)
     }
 
     // ------------------------------------------------------------ 配置
@@ -654,7 +846,8 @@ impl Core {
         match event {
             UiEvent::Ready { name, address } => {
                 self.set_status(RunState::Running);
-                self.detail = "已上线，等待投送".to_owned();
+                // 达到这一步说明之前的重试已经很成功，不再留任何提示。
+                self.detail.clear();
                 self.push_log(format!("已上线：{name} @ {address}"));
             }
             UiEvent::Stage { remote, stage } => {
@@ -663,12 +856,33 @@ impl Core {
                 }
                 if stage == "transport_disconnected" {
                     self.stage.clear();
+                    // 下一次连接重新开始握手，日志也重新记一轮。
+                    self.last_stage_log.clear();
                 } else {
-                    self.stage = stage_label(&stage).to_owned();
-                    self.push_log(format!("握手：{}", stage_label(&stage)));
+                    let label = stage_label(&stage);
+                    self.stage = label.to_owned();
+                    // 能力协商那一行带上对端上报的能力摘要；其余阶段只写阶段名。
+                    let line = if stage == "capabilities_exchanged"
+                        && !self.source_capability_summary.is_empty()
+                    {
+                        format!("握手：{label}（{}）", self.source_capability_summary)
+                    } else {
+                        format!("握手：{label}")
+                    };
+                    // 对端会周期性重发 SET_DEVICE_INFO（等同重复协商），同一句只记一次。
+                    if self.last_stage_log != line {
+                        self.last_stage_log = line.clone();
+                        self.push_log(line);
+                    }
                 }
             }
-            UiEvent::Source { name } => self.push_log(format!("对端设备：{name}")),
+            UiEvent::Source {
+                name,
+                capability_summary,
+            } => {
+                self.source_capability_summary = capability_summary;
+                self.push_log(format!("对端设备：{name}"));
+            }
             UiEvent::OutputReady { name } => {
                 self.active_output = Some(name.clone());
                 self.push_log(format!("输出设备：{name}"));
@@ -715,10 +929,7 @@ impl Core {
                     self.playing.duration_ms = duration;
                 }
             }
-            UiEvent::Playback { playing } => {
-                self.playing.playing = playing;
-                self.detail = if playing { "播放中" } else { "已暂停" }.to_owned();
-            }
+            UiEvent::Playback { playing } => self.playing.playing = playing,
             UiEvent::Volume { percent } => self.playing.volume = Some(percent),
             UiEvent::StreamClosed => {
                 self.reconnects += 1;
@@ -726,6 +937,8 @@ impl Core {
             }
             UiEvent::Error { message } => {
                 self.set_status(RunState::Failed);
+                // 同时记成 `last_failure`：自动启动的重试窗口到期后靠它把真实原因留在页头。
+                self.last_failure = message.clone();
                 self.detail = message.clone();
                 self.push_log(format!("错误：{message}"));
             }
@@ -832,6 +1045,94 @@ impl Core {
         while self.log.len() > LOG_LIMIT {
             self.log.pop_front();
         }
+        self.log_revision += 1;
+    }
+}
+
+/// 把日志拼成一段文本：最新在前（与日志页显示的阅读顺序一致）。
+fn log_text_of(log: &VecDeque<SharedString>) -> String {
+    // 按行长度一次预留，不为 1000 行反复扩容。
+    let mut text = String::with_capacity(log.iter().map(|line| line.len() + 1).sum());
+    for line in log.iter().rev() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(line);
+    }
+    text
+}
+
+/// 自动启动监护的一步决策。
+enum AutoStartStep {
+    /// 该起一次了（网卡就绪，但接收器还没起来）。
+    Start,
+    /// 再等一拍（网络没就绪，或运行中但还没坐稳）。
+    Wait,
+    /// 稳定运行足够久：自动启动算成功。
+    Stable,
+    /// 重试窗口到期：收手。
+    Expired,
+}
+
+/// 自动启动的判定逻辑：把「什么时候该起、什么时候算成功、什么时候放弃」收敛成一处。
+///
+/// 纯计算，状态与时间由调用方传入（循环拍子与单测共用同一套规则）。
+struct AutoStartWatch {
+    /// 放弃重试的时刻。
+    deadline: Instant,
+    /// 从什么时候开始持续「运行中」；`None` 表示当前不在运行态。
+    healthy_since: Option<Instant>,
+    /// 已经尝试启动过的次数（日志里用）。
+    attempts: u32,
+}
+
+impl AutoStartWatch {
+    /// 从 `now` 起算一个完整的重试窗口；`attempts` 是进入循环前已经试过的次数。
+    fn new(now: Instant, attempts: u32) -> Self {
+        Self {
+            deadline: now + AUTO_START_WINDOW,
+            healthy_since: None,
+            attempts,
+        }
+    }
+
+    /// 消费一拍：这一拍该干什么。窗口到期永远优先返回 `Expired`，循环必然收手。
+    ///
+    /// `lan_ready` 为假时不去动通道：开机没网时反复 `start` 只会失败并刷日志。
+    fn next(&mut self, status: RunState, lan_ready: bool, now: Instant) -> AutoStartStep {
+        if now >= self.deadline {
+            return AutoStartStep::Expired;
+        }
+        match status {
+            // `Idle` = 还没起过（开机时网卡没就绪）或刚被清空；`Failed` = 上一次没起来。
+            // 两种都是「该起一次」，网卡没就绪就先等。
+            RunState::Idle | RunState::Failed => {
+                self.healthy_since = None;
+                self.start(lan_ready)
+            }
+            RunState::Running => {
+                let since = *self.healthy_since.get_or_insert(now);
+                if now.duration_since(since) >= AUTO_START_STABLE {
+                    AutoStartStep::Stable
+                } else {
+                    AutoStartStep::Wait
+                }
+            }
+            // 过渡态：不插手，等下一拍。
+            RunState::Starting | RunState::Stopping => {
+                self.healthy_since = None;
+                AutoStartStep::Wait
+            }
+        }
+    }
+
+    /// 该起就起、不该起就等；只有真的要去起一次才计数。
+    fn start(&mut self, lan_ready: bool) -> AutoStartStep {
+        if !lan_ready {
+            return AutoStartStep::Wait;
+        }
+        self.attempts += 1;
+        AutoStartStep::Start
     }
 }
 
@@ -902,9 +1203,15 @@ fn host_of(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Autostart, StatusSummary, TextField, host_of, stage_label};
+    use super::{
+        AUTO_START_STABLE, AUTO_START_WINDOW, AutoStartStep, AutoStartWatch, Autostart,
+        StatusSummary, TextField, host_of, log_text_of, stage_label,
+    };
     use crate::core::config::Settings;
     use crate::core::state::RunState;
+    use gpui_kit::SharedString;
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn tooltip_shows_track_when_playing() {
@@ -958,5 +1265,107 @@ mod tests {
     fn only_applying_blocks_new_requests() {
         assert!(!Autostart::Idle.is_applying());
         assert!(Autostart::Applying { generation: 1 }.is_applying());
+    }
+
+    /// 日志文本按「最新在前」拼接（文本框第一行就是最新事件），空行之间用换行分隔。
+    #[test]
+    fn log_text_is_newest_first() {
+        let log = VecDeque::from([
+            SharedString::from("08:00:00  旧"),
+            SharedString::from("08:00:01  中"),
+            SharedString::from("08:00:02  新"),
+        ]);
+        assert_eq!(
+            log_text_of(&log),
+            "08:00:02  新\n08:00:01  中\n08:00:00  旧"
+        );
+        assert_eq!(log_text_of(&VecDeque::new()), "");
+    }
+
+    /// 失败态：网卡就绪就重试，没就绪就等（不去刷失败日志）。
+    #[test]
+    fn auto_start_retries_failures_only_when_lan_is_ready() {
+        let start = Instant::now();
+        let mut watch = AutoStartWatch::new(start, 1);
+        assert!(matches!(
+            watch.next(RunState::Failed, false, start),
+            AutoStartStep::Wait
+        ));
+        assert_eq!(watch.attempts, 1);
+        assert!(matches!(
+            watch.next(RunState::Failed, true, start),
+            AutoStartStep::Start
+        ));
+        assert!(matches!(
+            watch.next(RunState::Failed, true, start + Duration::from_secs(4)),
+            AutoStartStep::Start
+        ));
+        assert_eq!(watch.attempts, 3);
+        // 窗口到期：无论什么状态都收手，不会无限重试。
+        assert!(matches!(
+            watch.next(RunState::Failed, true, start + AUTO_START_WINDOW),
+            AutoStartStep::Expired
+        ));
+    }
+
+    /// 开机时网卡没就绪：不去起通道，等它自己就绪后再起。
+    #[test]
+    fn auto_start_waits_for_network_before_touching_the_channel() {
+        let start = Instant::now();
+        let mut watch = AutoStartWatch::new(start, 0);
+        assert!(matches!(
+            watch.next(RunState::Idle, false, start),
+            AutoStartStep::Wait
+        ));
+        assert_eq!(watch.attempts, 0);
+        assert!(matches!(
+            watch.next(RunState::Idle, true, start + Duration::from_secs(6)),
+            AutoStartStep::Start
+        ));
+        assert_eq!(watch.attempts, 1);
+    }
+
+    /// 乐观「运行中」要坐稳 `AUTO_START_STABLE` 才算成功（DLNA 的失败是异步回报的）。
+    #[test]
+    fn auto_start_waits_until_running_is_stable() {
+        let start = Instant::now();
+        let mut watch = AutoStartWatch::new(start, 1);
+        assert!(matches!(
+            watch.next(RunState::Running, true, start),
+            AutoStartStep::Wait
+        ));
+        assert!(matches!(
+            watch.next(RunState::Running, true, start + Duration::from_secs(2)),
+            AutoStartStep::Wait
+        ));
+        assert!(matches!(
+            watch.next(RunState::Running, true, start + AUTO_START_STABLE),
+            AutoStartStep::Stable
+        ));
+
+        // 中途掉回失败态：稳定性计时清零，重新算并下拍重试。
+        let mut watch = AutoStartWatch::new(start, 1);
+        assert!(matches!(
+            watch.next(RunState::Running, true, start),
+            AutoStartStep::Wait
+        ));
+        assert!(matches!(
+            watch.next(RunState::Failed, true, start + Duration::from_secs(3)),
+            AutoStartStep::Start
+        ));
+    }
+
+    /// 启动中 / 停止中不是失败：等下一拍，不重复起通道。
+    #[test]
+    fn auto_start_keeps_waiting_while_transitioning() {
+        let start = Instant::now();
+        let mut watch = AutoStartWatch::new(start, 1);
+        for status in [RunState::Starting, RunState::Stopping] {
+            assert!(
+                matches!(watch.next(status, true, start), AutoStartStep::Wait),
+                "{status:?}"
+            );
+        }
+        assert_eq!(watch.attempts, 1);
     }
 }

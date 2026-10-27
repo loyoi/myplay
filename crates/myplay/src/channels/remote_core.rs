@@ -44,6 +44,9 @@ impl CoreReceiver {
 
         // 核心只发事件，实际拉流/解码/出声由本进程的播放器完成。
         let player = Player::spawn(sink.clone(), settings.output_device_opt());
+        // 核心启动失败要报到界面：开机自启时网卡可能还没就绪，Core 看到失败态会自己重试；
+        // 如果只写控制台日志（release 没有控制台），界面就会一直停在「运行中」。
+        let failure_sink = sink.clone();
         let player_for_events = player.clone();
         let events = Arc::new(CoreEventSink::with_callback(Arc::new(
             move |raw: String| {
@@ -68,7 +71,9 @@ impl CoreReceiver {
                 {
                     Ok(runtime) => runtime,
                     Err(error) => {
-                        log::error!("无法创建核心运行时：{error}");
+                        let message = format!("DLNA 核心运行时启动失败：{error}");
+                        log::error!("{message}");
+                        let _ = failure_sink.send(UiEvent::Error { message });
                         return;
                     }
                 };
@@ -99,7 +104,11 @@ impl CoreReceiver {
                                 if confirmed { "是" } else { "超时未确认" }
                             );
                         }
-                        Err(error) => log::error!("DLNA DMR 启动失败：{error:#}"),
+                        Err(error) => {
+                            let message = format!("DLNA 服务未就绪：{error:#}");
+                            log::error!("{message}");
+                            let _ = failure_sink.send(UiEvent::Error { message });
+                        }
                     }
                 });
             })

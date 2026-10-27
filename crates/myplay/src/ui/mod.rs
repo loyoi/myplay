@@ -5,7 +5,13 @@
 //! （当前 Tab、文本焦点、下拉开关、输出设备列表）；用户意图一律转发给 Core 的方法，
 //! Core 每次 `notify` 都触发本视图重绘。
 
-use gpui_kit::component::{Sizable, h_flex, spinner::Spinner, v_flex};
+use gpui_kit::base::Link;
+use gpui_kit::component::{
+    Sizable, h_flex,
+    input::{Textarea, TextareaState},
+    spinner::Spinner,
+    v_flex,
+};
 use gpui_kit::*;
 
 use crate::channels::Snapshot;
@@ -15,8 +21,8 @@ use crate::core::state::RunState;
 use crate::platform::audio::{self, OutputDevice};
 use std::time::{Duration, Instant};
 
-/// 日志页最多渲染多少行（`uniform_list` 只渲染可见部分，这里只限制可回看的历史长度）。
-const LOG_VIEW_LIMIT: usize = 500;
+/// 项目仓库地址（`just release` 推送的就是它）。
+const GITHUB_REPO: &str = "https://github.com/loyoi/myplay";
 /// 播放器封面边长。
 const COVER_SIZE: Pixels = px(132.);
 /// 进度条高度与圆角（2px 圆角≈胶囊形，跟随条高）。
@@ -121,8 +127,10 @@ pub struct SettingsView {
     focused: Option<TextField>,
     /// 文本输入的焦点句柄。
     focus: FocusHandle,
-    /// 日志列表的滚动位置（窗口重开回到顶部属预期）。
-    log_scroll: UniformListScrollHandle,
+    /// 日志页的只读文本框（不可编辑，但能拖选 + Ctrl+C 复制）；窗口创建时建一次。
+    log_text: Option<Entity<TextareaState>>,
+    /// 已经写进文本框的日志版本；和 `Core::log_revision` 不同才重拼整段文本。
+    log_revision: u64,
     /// 输出设备下拉是否展开。
     audio_open: bool,
     /// 枚举到的输出设备（打开页面时枚举一次；切换设备不重新枚举）。
@@ -144,7 +152,8 @@ impl SettingsView {
             route: Route::Settings,
             focused: None,
             focus: cx.focus_handle(),
-            log_scroll: UniformListScrollHandle::new(),
+            log_text: None,
+            log_revision: 0,
             audio_open: false,
             audio_devices: audio::list_output_devices(),
             loading: LoadingPhase::Idle,
@@ -158,7 +167,20 @@ impl SettingsView {
     /// GPUI 随后在窗口 `Drop` 里再销毁一次，Windows 就会刷「无效的窗口句柄」。
     /// 改成 `remove_window` 后由 GPUI 自己移除窗口，句柄只销毁一次。
     /// 业务状态在 [`Core`] 里，窗口重开不丢。
-    pub fn attach_window(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn attach_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 日志文本框是窗口级控件（需要 `Window` 才能建），窗口重开时沿用同一个实体。
+        if self.log_text.is_none() {
+            self.log_text = Some(cx.new(|cx| {
+                let mut state = TextareaState::new(window, cx);
+                // 占位文字覆盖「日志被清空」和「刚建窗还没有日志」两种情况。
+                state.set_placeholder("暂无事件", window, cx);
+                // 日志一行一条：不软换行，过长的行改用横向滚动条看完。
+                state.set_soft_wrap(false, window, cx);
+                state
+            }));
+            // 上次关了窗口再打开时 Core 里可能早就有日志：建完立刻同步一次。
+            self.sync_log_text(window, cx);
+        }
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             let close_action = weak
@@ -231,7 +253,7 @@ impl SettingsView {
 // ---------------------------------------------------------------- 渲染
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 遮罩是否显示由时序阶段决定；在途任务由泵在后台推进，渲染本身不改状态。
         let overlay = self.loading.shows_overlay(Instant::now());
         let mut root = h_flex()
@@ -240,7 +262,7 @@ impl Render for SettingsView {
             .bg(rgb(0x16171b))
             .text_color(rgb(0xdfe3ea))
             .child(self.render_sidebar(cx))
-            .child(self.render_content(cx));
+            .child(self.render_content(window, cx));
         if overlay {
             root = root.child(render_loading_overlay());
         }
@@ -327,18 +349,25 @@ impl SettingsView {
         }
 
         column.child(div().flex_1()).child(
-            div()
-                .text_xs()
-                .text_color(rgb(0x6f7683))
-                .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x6f7683))
+                        .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+                )
+                .child(github_link()),
         )
     }
 
-    fn render_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 只读 Core 时把需要的值一次取完，避免持有借用再去拿 `&mut Context`。
-        let (status, running) = {
+        let (status, running, note) = {
             let core = self.core.read(cx);
-            (core.status, core.is_running())
+            (core.status, core.is_running(), core.detail.clone())
         };
         let status_color = match status {
             RunState::Running => rgb(0x3ecf8e),
@@ -346,70 +375,79 @@ impl SettingsView {
             _ => rgb(0x8b919d),
         };
         let route = self.route;
+        // 未启动且没有待解释的原因：标题栏给一句下一步提示（徽标只说「未启动」）。
+        let idle_hint = status == RunState::Idle && note.is_empty();
 
         let page: gpui_kit::AnyElement = match route {
             Route::Settings => self.render_settings_page(cx).into_any_element(),
             Route::Info => self.render_info_page(cx).into_any_element(),
-            Route::Log => self.render_log_page(cx).into_any_element(),
+            Route::Log => self.render_log_page(window, cx).into_any_element(),
         };
 
-        v_flex()
-            .flex_1()
-            .h_full()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .px_4()
-                    .py_3()
-                    .gap_3()
-                    .bg(rgb(0x1a1c21))
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .text_color(rgb(0xf2f4f8))
-                                    .child(route.label()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x8b919d))
-                                    .child(route.hint()),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(rgb(0x22252b))
-                                    .text_xs()
-                                    .text_color(status_color)
-                                    .child(status.label()),
-                            )
-                            .child(if running {
-                                action_button("停止", true, "btn-stop").on_click(cx.listener(
-                                    |view, _, _, cx| {
-                                        view.core.update(cx, |core, cx| core.stop(cx));
-                                    },
-                                ))
-                            } else {
-                                action_button("启动", false, "btn-start").on_click(cx.listener(
-                                    |view, _, _, cx| {
-                                        view.core.update(cx, |core, cx| core.start(cx));
-                                    },
-                                ))
-                            }),
-                    ),
-            )
-            .child(page)
+        let mut root = v_flex().flex_1().h_full().child(
+            h_flex()
+                .justify_between()
+                .items_center()
+                .px_4()
+                .py_3()
+                .gap_3()
+                .bg(rgb(0x1a1c21))
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_lg()
+                                .text_color(rgb(0xf2f4f8))
+                                .child(route.label()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x8b919d))
+                                .child(route.hint()),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .children(idle_hint.then(|| {
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x6f7683))
+                                .child("点击「启动」开始接收")
+                        }))
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x22252b))
+                                .text_xs()
+                                .text_color(status_color)
+                                .child(status.label()),
+                        )
+                        .child(if running {
+                            action_button("停止", true, "btn-stop").on_click(cx.listener(
+                                |view, _, _, cx| {
+                                    view.core.update(cx, |core, cx| core.stop(cx));
+                                },
+                            ))
+                        } else {
+                            action_button("启动", false, "btn-start").on_click(cx.listener(
+                                |view, _, _, cx| {
+                                    view.core.update(cx, |core, cx| core.start(cx));
+                                },
+                            ))
+                        }),
+                ),
+        );
+        // 徽标放不下的原因（失败、等待网络、重试中）才占一行。
+        if !note.is_empty() {
+            root = root.child(status_note(&note, status));
+        }
+        root.child(page)
     }
 
     fn render_settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -535,11 +573,6 @@ impl SettingsView {
             ]
         };
 
-        let detail = if core.detail.is_empty() {
-            "点击右上角「启动」开始接收".to_owned()
-        } else {
-            core.detail.clone()
-        };
         let player = self.render_now_playing(cx);
 
         v_flex()
@@ -548,9 +581,8 @@ impl SettingsView {
             .flex_1()
             .p_4()
             .gap_3()
-            .child(div().text_sm().text_color(rgb(0xa8aebb)).child(detail))
-            .child(card("广播信息", broadcast_rows))
             .child(player)
+            .child(card("广播信息", broadcast_rows))
             .child(card("连接与统计", stats_rows))
     }
 
@@ -696,43 +728,44 @@ impl SettingsView {
         )
     }
 
-    /// 日志页：最新 500 行，交给 `uniform_list` 只渲染可见部分。
-    fn render_log_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 日志页：整段日志放进只读文本框。
+    ///
+    /// 选中与复制全部交给控件（拖选 + Ctrl+C），`Core` 只提供文本；
+    /// 内容同步在 [`Self::sync_log_text`] 里，这里只管渲染。
+    fn render_log_page(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let total = self.core.read(cx).log.len();
-        let shown = total.min(LOG_VIEW_LIMIT);
-        let core = self.core.clone();
+        self.sync_log_text(window, cx);
 
-        let body: AnyElement = if shown == 0 {
-            div()
+        // 文本框在 `attach_window` 里就建好了；窗口生命周期外不会走到这里。
+        let Some(state) = &self.log_text else {
+            return div()
                 .text_xs()
                 .text_color(rgb(0x6f7683))
                 .child("暂无事件")
-                .into_any_element()
-        } else {
-            uniform_list("log-lines", shown, move |range, _window, cx| {
-                let log = &core.read(cx).log;
-                range
-                    .map(|index| {
-                        // 最新在前：index 0 是最后一行（最新），超出上限的旧行不再显示。
-                        let line = log
-                            .get(total.saturating_sub(1 + index))
-                            .cloned()
-                            .unwrap_or_default();
-                        div()
-                            .w_full()
-                            .h(px(18.))
-                            .px_4()
-                            .text_xs()
-                            .truncate()
-                            .text_color(rgb(0xa8aebb))
-                            .child(line)
-                    })
-                    .collect()
-            })
-            .flex_1()
-            .track_scroll(&self.log_scroll)
-            .into_any_element()
+                .into_any_element();
         };
+
+        let body = div()
+            .flex_1()
+            .min_h_0()
+            .rounded_md()
+            .border_1()
+            // 与其它卡片一致（`panel` / `card` 的底色与边框）。
+            .border_color(rgb(0x33363d))
+            .bg(rgb(0x1f2127))
+            .text_xs()
+            .child(
+                // 多行输入默认是 `h_auto()`（只有一行高），这里显式撑满剩余高度。
+                Textarea::new(state)
+                    .readonly(true)
+                    .appearance(false)
+                    .bordered(false)
+                    .h_full(),
+            );
 
         v_flex()
             .id("page-log")
@@ -747,7 +780,7 @@ impl SettingsView {
                         div()
                             .text_xs()
                             .text_color(rgb(0x8b919d))
-                            .child(format!("共 {total} 条（最新在前）")),
+                            .child(format!("共 {total} 条（最新在前，可拖选复制）")),
                     )
                     .child(
                         action_button("清空", false, "btn-clear-log").on_click(cx.listener(
@@ -758,6 +791,38 @@ impl SettingsView {
                     ),
             )
             .child(body)
+            .into_any_element()
+    }
+
+    /// 把最新日志写进只读文本框：只在「有新行」且用户没在选文字时动它。
+    ///
+    /// `set_value` 会清掉选区并把视图拉回顶部，所以拿选区当「用户正在复制」的信号：
+    /// 有选区就这一拍不动（版本号也不推进，下一条日志再同步）；
+    /// 否则写完把阅读位置补回新插入的一行，正在看旧日志的人不会被顶走。
+    fn sync_log_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.log_text.clone() else {
+            return;
+        };
+        let revision = self.core.read(cx).log_revision;
+        if revision == self.log_revision {
+            return;
+        }
+        if !state.read(cx).selected_range().is_empty() {
+            return;
+        }
+        self.log_revision = revision;
+        let text = self.core.read(cx).log_text();
+        state.update(cx, move |state, cx| {
+            let mut offset = state.scroll_offset();
+            state.set_value(text, window, cx);
+            // 贴着顶部时不恢复：那正是「最新在前」的阅读位置。
+            if offset.y > px(0.) {
+                if let Some(line) = state.line_height() {
+                    offset.y += line;
+                }
+                state.set_scroll_offset(offset, cx);
+            }
+        });
     }
 
     fn render_field(
@@ -1045,6 +1110,23 @@ fn section_title(text: &str) -> impl IntoElement {
         .child(text.to_owned())
 }
 
+/// 状态补充说明：徽标说不清的那部分（失败原因、等待网络、重试中）。
+///
+/// 只在 `Core::detail` 非空时渲染，失败用错误色，其余用次要文字色。
+fn status_note(text: &str, status: RunState) -> impl IntoElement {
+    let color = if status == RunState::Failed {
+        rgb(0xff6b81)
+    } else {
+        rgb(0x8b919d)
+    };
+    div()
+        .px_4()
+        .pt_2()
+        .text_xs()
+        .text_color(color)
+        .child(text.to_owned())
+}
+
 fn field_caption(text: &str) -> impl IntoElement {
     div()
         .text_xs()
@@ -1118,6 +1200,22 @@ fn chip(label: &'static str, selected: bool) -> gpui_kit::Stateful<gpui_kit::Div
         })
         .cursor_pointer()
         .child(label)
+}
+
+/// 侧边栏底部的 GitHub 入口：图标点击后交给系统浏览器打开项目仓库。
+///
+/// 用 `base::Link` 而不是普通 `div` + `on_click`：它自带角色、焦点与键盘激活语义。
+fn github_link() -> impl IntoElement {
+    Link::new("link-github")
+        .href(GITHUB_REPO)
+        .open_with(|href, _, _, cx| cx.open_url(href))
+        .accessibility_label("在浏览器中打开 myplay 的 GitHub 仓库")
+        .text_xs()
+        .text_color(rgb(0x6f7683))
+        .cursor_pointer()
+        .hover(|style| style.text_color(rgb(0xdfe3ea)))
+        // 图标跟随环境文字色（含 hover），因此不另设颜色。
+        .child(gpui_kit::assets::IconName::Github)
 }
 
 fn action_button(

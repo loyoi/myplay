@@ -48,14 +48,20 @@ crates/fusionplay-if-addrs/     # if-addrs 适配层，crate 名仍为 if-addrs�
 
 ## 已完成
 
+- **L1**：`ui/mod.rs`（侧边栏 + 三页设置/信息/日志；侧边栏底部是版本号 + GitHub 入口）；日志页是
+  组件库的只读 `Textarea`（拖选 + Ctrl+C 即复制，不可编辑），它靠组件主题上色，因此 `main` 的
+  `apply_component_theme` 先切深色主题并把前景/边框/选中色对到应用自己的配色；GitHub 图标走
+  `gpui_kit::assets::IconName`，SVG 资产由 `application().with_assets(...)` 注册
 - **L2**：`shell/tray.rs`（托盘线程 + 右键菜单 + 代码生成图标 + tooltip 回传刷新，左键只开窗口）、
   `shell/window.rs`（`SharedView` 全局、`APP_TITLE`、单例 `open_main_window` + `present_main_window` /
   `minimize_main_window`：按根视图类型认窗口，启动/托盘唤出都显式抢一次前台）
 - **L3**：`core/config.rs`（配置与持久化）、`core/state.rs`（五态状态机，5 单测）、
-  `core/event.rs`（妙播 SDK 事件 → `UiEvent`，4 单测）、
-  `core/app.rs`（`Core`：唯一业务状态源，拥有配置/状态机/通道/日志/播放信息，5 单测）
+  `core/event.rs`（妙播 SDK 事件 → `UiEvent`，7 单测）、
+  `core/app.rs`（`Core`：唯一业务状态源，拥有配置/状态机/通道/日志/播放信息，11 单测）
 - **L4**：`channels/mod.rs` 的 `Channel` trait 由 `miplay::Receiver` 与 `remote_core::CoreReceiver`
-  直接实现（不再有转发包装类型）；`dlna_player.rs` 为 DLNA 本地播放（流式拉流、Range seek、
+  直接实现（不再有转发包装类型）；同文件里的 `usable_v4` 是「哪块网卡能承载广播」的唯一判定，
+  妙播选网卡（`miplay::resolve_interface`）与还原启动的前置检查（`lan_ready`）共用它；
+  `dlna_player.rs` 为 DLNA 本地播放（流式拉流、Range seek、
   服务端忽略 Range 时整包缓存 / 本地跳字节补偿、重采样到设备采样率、cpal 输出、进度回填 DMR；每首曲目开头打一行质量诊断日志：控制点声明的质量 vs 实测编码/字节/时长/码率）；
   `remote_core::translate` 是核心事件词表的唯一翻译点
 
@@ -63,10 +69,12 @@ crates/fusionplay-if-addrs/     # if-addrs 适配层，crate 名仍为 if-addrs�
 
 | 状态 | 归属 | 说明 |
 |---|---|---|
-| `settings` `status` `detail` `snapshot` `playing` `peer` `stage` `log` | `Core` | 业务状态，进程级 |
+| `settings` `status` `detail` `snapshot` `playing` `peer` `stage` `log` `log_revision` | `Core` | 业务状态，进程级；`log_revision` 是日志版本号，日志页据此判断要不要重写文本框；`detail` 只装徽标放不下的原因（失败、等待网络、重试中），徽标能说清时为空 |
 | `channel` `sink` `artwork_request_tx` `log_tx` `status_tx` `started_at` `tracks` `reconnects` | `Core` | 私有，只能通过方法改动 |
+| `auto_start_generation` `last_failure` | `Core` | 私有；自动启动重试的代次与原始失败原因（`detail` 可能带「正在重试」提示） |
+| `source_capabilities` `last_stage_log` | `Core` | 私有；对端在能力协商里上报的能力表摘要，以及上一行握手日志（同句不重复刷） |
 | `active_output` `start_minimized_pending` | `Core` | 由事件/配置派生；运行中的通道类型由 `active_source()` 从 `channel` + `settings.source` 算出，不额外存副本 |
-| `route` `focused` `focus` `log_scroll` `audio_open` `audio_devices` | `SettingsView` | 纯界面状态，重开窗口重置 |
+| `route` `focused` `focus` `log_text` `log_revision` `audio_open` `audio_devices` | `SettingsView` | 纯界面状态，重开窗口重置（`log_text` 是组件库的只读文本框实体） |
 
 ### 数据流
 
@@ -108,6 +116,22 @@ DLNA 停止的顺序是固定的：`Core::stop` → 播放器收到 `Stop`（立
 `STOPPED / ready=false`）→ 核心线程等这条回报落地（上限 300 ms）→ `service.stop()`
 （SSDP 发 `byebye`、HTTP 监听关闭）→ 再留 80 ms 让 GENA 通知离场，最后丢弃运行时。
 这样控制点在设备消失前就能收到「已停止」，不会因为运行时先死而收不到通知。
+
+### 开机自启的还原启动（网卡空窗）
+
+开机瞬间网卡常常还没拿到 DHCP 地址，而妙播的 mDNS 广播、DLNA 的 SSDP 组播都必须先有 IPv4。
+这段空窗以前被当成硬错误：接收器直接进 `Failed`，用户得手动再点一次启动。现在的规则：
+
+- `main` 走 `Core::restore_start`（手动启停才走 `start`），先把 `restore_running` 意图记下来。
+- 网卡未就绪（`channels::lan_ready()` 为假）时**不起通道**，只把 `detail` 置为
+  「等待网络就绪后自动启动」（页头徽标下方那一行），避免每 2 秒失败一次把日志页刷满。
+- 监护循环（`AutoStartWatch`，2 s 一拍，最长 90 s）在网卡就绪后拉起通道；失败则继续重试。
+- 判定成功要求连续 `Running` 满 5 s：DLNA 的 `start` 先返回成功、服务失败由核心异步回报，
+  乐观的 `Running` 不能当真。到期仍未成功就撤掉「正在重试」提示，只留真实原因。
+- 重试期间的多次失败不写事件日志（只写 `log::info!`），开头与结果各记一条。
+- 用户手动 `start` / `stop` / `shutdown` 会推进代次，在途循环自行退出，绝不抢用户意图。
+- DLNA 核心的异步启动失败必须经 `UiEvent::Error` 报到 `Core`：release 没有控制台，
+  以前只写 `log::error!`，界面会一直停在「运行中」。
 
 ### 已知限制：控制点切走时不会通知渲染器
 
@@ -160,7 +184,7 @@ Pause / Stop / Seek` 负责。实测（手机投送代理）：控制点把播�
 ```powershell
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p myplay   # 39 单测：state 5 / event 4 / app 5 / config 2 / dlna_player 16 / remote_core 3 / miplay 1 / audio 1 / system 1 / single_instance 1
+cargo test -p myplay   # 53 单测：state 5 / event 7 / app 11 / config 2 / dlna_player 16 / remote_core 3 / miplay 1 / audio 1 / system 2 / single_instance 1 / ui 4
 cargo run -p myplay
 ```
 
@@ -171,6 +195,15 @@ cargo run -p myplay
 - 重复启动 exe：第二个进程直接退出，已在跑的实例把窗口叫到前台（关着窗口也会重新打开），不会出现两个托盘图标
 - 两个通道各启动/停止/切换一次无回归
 - 启停状态还原：启动后退出 → 再开仍自动运行；停止后退出 → 再开仍为停止（参数不变）
+- 断网后启动：显示「等待网络就绪」，连上 WiFi 后不点任何按钮即在几秒内自动上线；
+  重试期间点「停止」不会再自己起来
 - 托盘「启动/停止/播放暂停」与窗口按钮行为一致；tooltip 随曲目与状态变化
-- 日志页滚动正常、条数上限 1000；改「日志文件」后新行落到新路径
+- 日志页是组件库的只读文本框（`Textarea` + `readonly`）：拖选 + Ctrl+C 由控件自己负责，
+  `Core` 只提供整段文本（`log_text()`，最新在前）；关闭软换行（`set_soft_wrap(false)`），
+  长行用横向滚动看。同步由 `SettingsView::sync_log_text` 一处负责：日志版本号变了才 `set_value`
+  一次；用户正在拖选（选区非空）时这一拍跳过、版本号也不推进，下一条日志再同步；
+  往下翻着读时按新插入的一行补偿滚动位置，不被顶回顶部。条数上限 1000；
+  改「日志文件」后新行落到新路径
+- 失败/等待网络时页头下方出一行说明（`Core::detail`）；徽标能说清的状态不多写一行
+- 投送一首歌时日志里的握手阶段不再成批重复，能力协商那一行能看到对端上报的能力表
 - 文本字段逐键输入不再卡顿，回车/失焦/关窗后改动落到 `settings.json`

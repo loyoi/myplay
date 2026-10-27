@@ -14,7 +14,7 @@ use fusionplay_miplay_sdk::{
 };
 use serde_json::Value;
 
-use crate::channels::EventSink;
+use crate::channels::{EventSink, usable_v4};
 use crate::core::config::{Settings, data_dir};
 use crate::core::event;
 
@@ -155,9 +155,7 @@ fn resolve_interface(settings: &Settings) -> Result<(Ipv4Addr, String)> {
     let mut candidates: Vec<(Ipv4Addr, String)> = interfaces
         .iter()
         .filter(|interface| {
-            !interface.is_loopback()
-                && !interface.is_link_local()
-                && interface.oper_status != if_addrs::IfOperStatus::Down
+            usable_v4(interface)
                 && (settings.interface.is_empty() || interface.name == settings.interface)
         })
         .filter_map(|interface| match interface.addr {
